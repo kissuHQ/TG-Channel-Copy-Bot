@@ -3,17 +3,17 @@
   "source_title": "PRIVET COURSE",
   "target": -1003991703301,
   "target_title": "Advance Database Channel",
-  "running": false,
+  "running": true,
   "paused": false,
   "stats": {
-    "text": 1,
+    "text": 0,
     "photo": 0,
-    "video": 0,
-    "doc": 0,
+    "video": 3,
+    "doc": 4,
     "other": 0,
     "failed": 0
   },
-  "current_id": 1,
-  "total_msgs": 8722,
-  "last_synced_id": 4
+  "current_id": 7,
+  "total_msgs": 10,
+  "last_synced_id": 8813
 }

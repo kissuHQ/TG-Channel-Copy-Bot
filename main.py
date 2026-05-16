@@ -24,8 +24,10 @@ from telethon.tl.types import (
     MessageMediaWebPage
 )
 from telethon.errors import (
-    FloodWaitError, ChatWriteForbiddenError,
-    ChannelPrivateError
+    FloodWaitError, ChatWriteForbiddenError, ChannelPrivateError,
+    FileReferenceExpiredError, MediaInvalidError, FilePartMissingError,
+    SlowModeWaitError, BadMessageError, TimeoutError as TgTimeoutError,
+    ServerError,
 )
 
 from telegram import Update
@@ -92,18 +94,10 @@ def save_state(state):
 state = load_state()
 
 # ─── FAST PARALLEL DOWNLOADER (stride method) ─────────
-async def fast_download(media) -> bytes:
+async def fast_download(media, progress_cb=None) -> bytes:
     """
-    iter_download ka stride trick use karke true parallel MTProto download:
-
-    N workers, har ek stride=N*CHUNK_SIZE ke saath alag offset se shuru hota hai:
-      Worker 0 → chunks 0, N, 2N, 3N ...   (offset=0,            stride=N*CHUNK)
-      Worker 1 → chunks 1, N+1, 2N+1 ...   (offset=1*CHUNK,      stride=N*CHUNK)
-      Worker 2 → chunks 2, N+2, 2N+2 ...   (offset=2*CHUNK,      stride=N*CHUNK)
-      ...
-    asyncio.gather se sab ek saath → interleave → original file
-
-    Photo / small file (<2MB) → single download (overhead nahi chahiye)
+    Stride-based parallel download + optional progress_cb(current, total).
+    Photo / small file (<2MB) → single download.
     """
     if not isinstance(media, MessageMediaDocument) or not media.document:
         return await client.download_media(media, file=bytes)
@@ -114,14 +108,16 @@ async def fast_download(media) -> bytes:
         logger.debug(f"Small file {total_size//1024}KB — single download")
         return await client.download_media(media, file=bytes)
 
-    stride = PARALLEL_WORKERS * CHUNK_SIZE
+    stride      = PARALLEL_WORKERS * CHUNK_SIZE
+    downloaded  = [0]          # shared mutable counter (asyncio single-thread safe)
+    _last_cb    = [0.0]        # throttle: max 1 progress_cb call per 0.5s
+
     logger.debug(
         f"Parallel stride download | size={total_size//1024}KB "
         f"workers={PARALLEL_WORKERS} chunk={CHUNK_SIZE//1024}KB"
     )
 
     async def worker(worker_id: int) -> list:
-        """Har worker apne assigned chunks download karta hai"""
         parts = []
         async for chunk in client.iter_download(
             media,
@@ -130,12 +126,17 @@ async def fast_download(media) -> bytes:
             request_size = CHUNK_SIZE,
         ):
             parts.append(chunk)
+            downloaded[0] += len(chunk)
+            if progress_cb:
+                now = time.time()
+                if now - _last_cb[0] >= 0.5:
+                    _last_cb[0] = now
+                    await progress_cb(downloaded[0], total_size)
         return parts
 
-    # Sab workers ek saath chalao
     all_parts = await asyncio.gather(*[worker(i) for i in range(PARALLEL_WORKERS)])
 
-    # Interleave: [w0[0], w1[0], w2[0], w3[0], w0[1], w1[1], ...]
+    # Interleave: w0[0], w1[0], w2[0], ..., w0[1], w1[1], ...
     max_len = max((len(p) for p in all_parts), default=0)
     result  = []
     for i in range(max_len):
@@ -812,12 +813,70 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit, is_bot
                 await asyncio.sleep(2)
                 state.update(load_state())
 
+            # ── Progress callback (logs + bot preview) ────────
+            _prog_last_edit = [0.0]
+            _prog_last_log  = [-1]   # last logged pct (avoid duplicate logs)
+
+            async def on_progress(phase: str, current: int, total: int):
+                if total <= 0:
+                    return
+                pct      = int(current / total * 100)
+                size_mb  = total / 1024 / 1024
+                icon     = "📥" if phase == "download" else "📤"
+                phase_lbl = "Download" if phase == "download" else "Upload"
+
+                # Log every 25% (once per milestone)
+                milestone = (pct // 25) * 25
+                if milestone != _prog_last_log[0] and pct >= milestone:
+                    _prog_last_log[0] = milestone
+                    logger.info(
+                        f"  {icon} {phase_lbl} {milestone}% "
+                        f"({current//1024}KB / {total//1024}KB) "
+                        f"msg_id={message.id}"
+                    )
+
+                # Bot edit throttle — max 1 edit per 4s during transfer
+                now = time.time()
+                if now - _prog_last_edit[0] >= 4.0:
+                    _prog_last_edit[0] = now
+                    bar = _make_progress_bar(pct, 100, width=12)
+                    elapsed  = now - start_time
+                    speed    = count / (elapsed / 60) if elapsed > 0 else 0
+                    await edit_msg(
+                        f"⚡ *Syncing...*\n\n"
+                        f"📥 `{src_title}`\n"
+                        f"📤 `{tgt_title}`\n\n"
+                        f"📊 Msgs: *{count}* / {total_count}\n\n"
+                        f"{icon} *{phase_lbl}ing file...*\n"
+                        f"`{bar}` {pct}%\n"
+                        f"📦 {current/1024/1024:.1f} / {size_mb:.1f} MB\n\n"
+                        f"🚀 Speed: {speed:.1f} msg/min",
+                        parse_mode="Markdown"
+                    )
+            # ─────────────────────────────────────────────────
+
             try:
                 msg_type = get_msg_type(message)
-                logger.debug(
-                    f"Sending msg_id={message.id} type={msg_type}"
-                )
-                sent = await send_message(target_entity, message)
+                logger.debug(f"Sending msg_id={message.id} type={msg_type}")
+
+                # Retry loop for transient errors (max 3 attempts)
+                MAX_RETRIES = 3
+                for attempt in range(1, MAX_RETRIES + 1):
+                    try:
+                        sent = await send_message(
+                            target_entity, message,
+                            on_progress=on_progress if msg_type != "text" else None
+                        )
+                        break   # success
+                    except (FilePartMissingError, TgTimeoutError, ServerError) as retry_err:
+                        if attempt == MAX_RETRIES:
+                            raise
+                        wait = 5 * attempt
+                        logger.warning(
+                            f"⚠️ Transient error (attempt {attempt}/{MAX_RETRIES}) "
+                            f"msg_id={message.id}: {retry_err} — retry in {wait}s"
+                        )
+                        await asyncio.sleep(wait)
 
                 if sent:
                     count += 1
@@ -830,7 +889,7 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit, is_bot
                         f"✅ Sent [{count}/{total_count}] id={message.id} type={msg_type}"
                     )
 
-                    # Live preview — update every message, max 1 edit/sec
+                    # Main progress update after each successful send
                     now = time.time()
                     if now - _last_edit >= 1.0:
                         _last_edit = now
@@ -871,8 +930,18 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit, is_bot
                 await edit_msg(
                     f"⏸️ *FloodWait!*\n\n"
                     f"Telegram ne slow karne kaha\n"
-                    f"⏱ Wait: *{wait}s*\n\n"
+                    f"⏱ Waiting: *{wait}s*\n\n"
                     f"Progress: {count}/{total_count}",
+                    parse_mode="Markdown"
+                )
+                await asyncio.sleep(wait)
+
+            except SlowModeWaitError as e:
+                wait = e.seconds + 5
+                logger.warning(f"SlowMode {wait}s after msg_id={message.id}")
+                await edit_msg(
+                    f"🐢 *SlowMode Active!*\n\nTarget channel ka slow mode on hai\n"
+                    f"⏱ Wait: *{wait}s*",
                     parse_mode="Markdown"
                 )
                 await asyncio.sleep(wait)
@@ -884,12 +953,35 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit, is_bot
                 save_state(state)
                 return
 
+            except (FileReferenceExpiredError, MediaInvalidError) as e:
+                # Media expired ya invalid — skip karo, count nahi badhe ga
+                failed += 1
+                stats["failed"] = failed
+                state["stats"]  = stats
+                save_state(state)
+                logger.warning(
+                    f"⏭️ Skipped msg_id={message.id} — media unavailable: {type(e).__name__}"
+                )
+                await asyncio.sleep(MSG_DELAY)
+                continue
+
+            except BadMessageError as e:
+                logger.error(f"BadMessageError msg_id={message.id}: {e}")
+                failed += 1
+                stats["failed"] = failed
+                state["stats"]  = stats
+                save_state(state)
+                await asyncio.sleep(MSG_DELAY)
+                continue
+
             except Exception as e:
                 failed += 1
                 stats["failed"] = failed
                 state["stats"]  = stats
                 save_state(state)
-                logger.error(f"❌ msg_id={message.id} FAILED: {e}")
+                logger.error(
+                    f"❌ msg_id={message.id} FAILED [{type(e).__name__}]: {e}"
+                )
                 await asyncio.sleep(MSG_DELAY)
                 continue
 
@@ -931,26 +1023,41 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit, is_bot
         await edit_msg(f"❌ Fatal error: {e}")
 
 
-async def send_message(target, message):
+async def send_message(target, message, on_progress=None):
     """
-    Sequential send:
-    - Media: parallel chunk download (RAM) → 512 KB chunk upload
+    Sequential send with optional progress callbacks.
+    on_progress: async (phase: "download"|"upload", current: int, total: int)
+    - Media: parallel download → 512KB chunk upload
     - Text: seedha bhejo
     """
     if message.media and not isinstance(message.media, MessageMediaWebPage):
-        buf = await fast_download(message.media)
+
+        # ── Download ──────────────────────────────────────
+        async def dl_cb(current, total):
+            if on_progress:
+                await on_progress("download", current, total)
+
+        buf = await fast_download(message.media, progress_cb=dl_cb if on_progress else None)
         if not buf:
             raise Exception("Media download failed (empty buffer)")
-        caption = message.text or ""
-        file_size_kb = len(buf) // 1024
-        logger.debug(f"Uploading {file_size_kb} KB with part_size_kb=512")
+
+        total_bytes = len(buf)
+        caption     = message.text or ""
+        logger.debug(f"Uploading {total_bytes//1024}KB with part_size_kb=512")
+
+        # ── Upload ────────────────────────────────────────
+        async def ul_cb(current, total):
+            if on_progress:
+                await on_progress("upload", current, total)
+
         await client.send_file(
             target,
-            file=buf,
-            caption=caption,
-            parse_mode="md",
-            force_document=False,
-            part_size_kb=512,       # max upload chunk size
+            file              = buf,
+            caption           = caption,
+            parse_mode        = "md",
+            force_document    = False,
+            part_size_kb      = 512,
+            progress_callback = ul_cb,
         )
         return True
 
@@ -958,8 +1065,8 @@ async def send_message(target, message):
         await client.send_message(
             target,
             message.text,
-            parse_mode="md",
-            link_preview=False
+            parse_mode   = "md",
+            link_preview = False
         )
         return True
 
