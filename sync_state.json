@@ -1,0 +1,19 @@
+{
+  "source": -1003465156649,
+  "source_title": "PRIVET COURSE",
+  "target": -1003991703301,
+  "target_title": "Advance Database Channel",
+  "running": false,
+  "paused": false,
+  "stats": {
+    "text": 15,
+    "photo": 0,
+    "video": 0,
+    "doc": 0,
+    "other": 0,
+    "failed": 17
+  },
+  "current_id": 15,
+  "total_msgs": 8722,
+  "last_synced_id": 35
+}

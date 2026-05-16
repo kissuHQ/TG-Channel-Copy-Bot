@@ -761,26 +761,52 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit, is_bot
 
 
 async def send_message(target, message):
-    try:
-        if message.media and not isinstance(message.media, MessageMediaWebPage):
+    """
+    Ek message ek ek karke bhejo:
+    - Media ho to pehle download karo, phir caption ke saath upload karo
+    - Sirf text ho to seedha bhejo
+    - Dono kaam hone ke baad hi return karo (sequential)
+    """
+    import tempfile, os as _os
+
+    if message.media and not isinstance(message.media, MessageMediaWebPage):
+        # Pehle media download karo temp file mein
+        tmp_path = None
+        downloaded = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False) as tmp:
+                tmp_path = tmp.name
+            downloaded = await client.download_media(message.media, file=tmp_path)
+            if not downloaded:
+                raise Exception("Media download failed (None returned)")
+            caption = message.text or ""
             await client.send_file(
                 target,
-                file=message.media,
-                caption=message.text or "",
-                parse_mode="md"
-            )
-            return True
-        elif message.text:
-            await client.send_message(
-                target,
-                message.text,
+                file=downloaded,
+                caption=caption,
                 parse_mode="md",
-                link_preview=False
+                force_document=False
             )
             return True
-        return False
-    except Exception as e:
-        raise e
+        finally:
+            # Temp files cleanup
+            for fpath in {tmp_path, downloaded}:
+                if fpath and _os.path.exists(fpath):
+                    try:
+                        _os.remove(fpath)
+                    except Exception:
+                        pass
+
+    elif message.text:
+        await client.send_message(
+            target,
+            message.text,
+            parse_mode="md",
+            link_preview=False
+        )
+        return True
+
+    return False
 
 
 def get_msg_type(message) -> str:
