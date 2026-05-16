@@ -67,6 +67,10 @@ logger.addHandler(_fh)
 logger.addHandler(_ch)
 # ──────────────────────────────────────────────────────
 
+CHUNK_SIZE       = 512 * 1024   # 512 KB per chunk (Telegram max)
+PARALLEL_WORKERS = 4             # parallel chunk download threads
+SMALL_FILE_LIMIT = 2 * 1024 * 1024  # files < 2 MB: no parallel needed
+
 client = TelegramClient(
     SESSION_FILE, API_ID, API_HASH,
     connection_retries=5,
@@ -85,6 +89,55 @@ def save_state(state):
         json.dump(state, f, indent=2)
 
 state = load_state()
+
+# ─── FAST PARALLEL DOWNLOADER ─────────────────────────
+async def fast_download(media) -> bytes:
+    """
+    Large files (documents/videos): PARALLEL_WORKERS goroutines,
+    har ek alag offset se CHUNK_SIZE blocks download karta hai → asyncio.gather.
+    Photos / small files: seedha bytes mein download (overhead nahi chahiye).
+    """
+    # Photo ya koi bhi non-document → simple download
+    if not isinstance(media, MessageMediaDocument) or not media.document:
+        return await client.download_media(media, file=bytes)
+
+    total_size = media.document.size
+
+    # Chhoti file → parallel overhead se fayda nahi
+    if total_size < SMALL_FILE_LIMIT:
+        return await client.download_media(media, file=bytes)
+
+    # Chunks align to CHUNK_SIZE (Telegram requirement)
+    num_chunks  = (total_size + CHUNK_SIZE - 1) // CHUNK_SIZE
+    # Har worker kitne chunks handle karega
+    chunks_per_worker = max(1, (num_chunks + PARALLEL_WORKERS - 1) // PARALLEL_WORKERS)
+
+    async def download_part(start_chunk: int) -> bytes:
+        """start_chunk index se le kar apna hissa download karo"""
+        offset      = start_chunk * CHUNK_SIZE
+        byte_limit  = min(chunks_per_worker * CHUNK_SIZE, total_size - offset)
+        if byte_limit <= 0:
+            return b""
+        parts = []
+        async for chunk in client.iter_download(
+            media,
+            offset       = offset,
+            limit        = byte_limit,
+            request_size = CHUNK_SIZE,
+        ):
+            parts.append(chunk)
+        return b"".join(parts)
+
+    # Parallel tasks — ek time pe PARALLEL_WORKERS downloads
+    worker_starts = list(range(0, num_chunks, chunks_per_worker))
+    logger.debug(
+        f"Parallel download | size={total_size//1024}KB "
+        f"workers={len(worker_starts)} chunk={CHUNK_SIZE//1024}KB"
+    )
+    parts = await asyncio.gather(*[download_part(s) for s in worker_starts])
+    return b"".join(parts)
+# ──────────────────────────────────────────────────────
+
 
 # ─── HELPERS ──────────────────────────────────────────
 def is_owner(user_id: int) -> bool:
@@ -873,21 +926,23 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit, is_bot
 async def send_message(target, message):
     """
     Sequential send:
-    - Media: RAM mein download (no disk I/O) → caption ke saath upload
+    - Media: parallel chunk download (RAM) → 512 KB chunk upload
     - Text: seedha bhejo
     """
     if message.media and not isinstance(message.media, MessageMediaWebPage):
-        # bytes buffer use karo — temp file se 2-3x fast
-        buf = await client.download_media(message.media, file=bytes)
+        buf = await fast_download(message.media)
         if not buf:
             raise Exception("Media download failed (empty buffer)")
         caption = message.text or ""
+        file_size_kb = len(buf) // 1024
+        logger.debug(f"Uploading {file_size_kb} KB with part_size_kb=512")
         await client.send_file(
             target,
             file=buf,
             caption=caption,
             parse_mode="md",
-            force_document=False
+            force_document=False,
+            part_size_kb=512,       # max upload chunk size
         )
         return True
 
