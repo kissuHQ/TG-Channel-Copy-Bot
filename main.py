@@ -100,8 +100,10 @@ async def cmd_help(event):
         return
     await event.edit(
         "🤖 **Archive Bot Commands**\n\n"
-        "`.setsource <channel>` — Source channel set karo\n"
-        "`.settarget <channel>` — Target channel set karo\n"
+        "`.setsource @user / -100id / link` — Source set karo\n"
+        "`.setsource` (forwarded msg pe reply) — Private channel source set\n"
+        "`.settarget @user / -100id / link` — Target set karo\n"
+        "`.settarget` (forwarded msg pe reply) — Private channel target set\n"
         "`.info` — Current config dekho\n"
         "`.sync` — Full sync start karo (sab messages)\n"
         "`.syncfrom <id>` — Specific message ID se sync karo\n"
@@ -116,34 +118,119 @@ async def cmd_help(event):
     )
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=r"^\.setsource (.+)$"))
+def parse_channel_input(text):
+    """
+    Channel input ko normalize karo — support:
+    - @username
+    - -100xxxxxxxxxx  (channel ID)
+    - plain number like 1234567890 (auto -100 prefix lagao)
+    - https://t.me/username  ya  t.me/username
+    - https://t.me/+invitehash  ya  t.me/joinchat/hash  (private invite)
+    """
+    text = text.strip()
+    # Pure numeric ya -100 wala ID
+    if text.lstrip("-").isdigit():
+        num = int(text)
+        # Agar positive number diya to -100 prefix laga do
+        if num > 0:
+            num = int(f"-100{num}")
+        return num
+    # t.me ya telegram.me links
+    import re as _re
+    link_match = _re.match(
+        r"(?:https?://)?(?:t(?:elegram)?\.me|telegram\.org)/(?:joinchat/)?(.+)",
+        text, _re.IGNORECASE
+    )
+    if link_match:
+        path = link_match.group(1).rstrip("/")
+        # Private invite link (+hash)
+        if path.startswith("+"):
+            return text  # Telethon handles full invite URL
+        return f"@{path}" if not path.startswith("@") else path
+    return text
+
+
+async def get_channel_from_event(event):
+    """
+    Forwarded message reply se channel ID nikalo (userbot ke liye).
+    Returns (channel_identifier, entity) ya (None, None)
+    """
+    if event.is_reply:
+        replied = await event.get_reply_message()
+        if replied and replied.fwd_from:
+            fwd = replied.fwd_from
+            peer = getattr(fwd, "from_id", None) or getattr(fwd, "channel_id", None)
+            if peer:
+                try:
+                    entity = await client.get_entity(peer)
+                    cid = entity.id
+                    channel_id = int(f"-100{cid}") if cid > 0 else cid
+                    return channel_id, entity
+                except Exception:
+                    pass
+    return None, None
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=r"^\.setsource(.*)$"))
 async def cmd_setsource(event):
     if not is_owner(event.sender_id):
         return
-    channel = event.pattern_match.group(1).strip()
-    try:
-        entity = await client.get_entity(channel)
-        state["source"] = channel
-        state["source_title"] = getattr(entity, "title", channel)
-        save_state(state)
-        await event.edit(f"✅ Source set: **{state['source_title']}**\n`{channel}`")
-    except Exception as e:
-        await event.edit(f"❌ Error: `{e}`")
+    arg = event.pattern_match.group(1).strip()
+
+    if not arg:
+        # Forwarded message se try karo
+        channel, entity = await get_channel_from_event(event)
+        if channel is None:
+            await event.edit(
+                "❌ Usage:\n"
+                "`.setsource @username` — public channel\n"
+                "`.setsource -100xxxxxxxxxx` — channel ID (private ke liye)\n"
+                "Ya kisi bhi channel ka message forward karke us pe reply karo `.setsource`"
+            )
+            return
+    else:
+        channel = parse_channel_input(arg)
+        try:
+            entity = await client.get_entity(channel)
+        except Exception as e:
+            await event.edit(f"❌ Error: `{e}`")
+            return
+
+    state["source"] = channel
+    state["source_title"] = getattr(entity, "title", str(channel))
+    save_state(state)
+    await event.edit(f"✅ Source set: **{state['source_title']}**\n`{channel}`")
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=r"^\.settarget (.+)$"))
+@client.on(events.NewMessage(outgoing=True, pattern=r"^\.settarget(.*)$"))
 async def cmd_settarget(event):
     if not is_owner(event.sender_id):
         return
-    channel = event.pattern_match.group(1).strip()
-    try:
-        entity = await client.get_entity(channel)
-        state["target"] = channel
-        state["target_title"] = getattr(entity, "title", channel)
-        save_state(state)
-        await event.edit(f"✅ Target set: **{state['target_title']}**\n`{channel}`")
-    except Exception as e:
-        await event.edit(f"❌ Error: `{e}`")
+    arg = event.pattern_match.group(1).strip()
+
+    if not arg:
+        # Forwarded message se try karo
+        channel, entity = await get_channel_from_event(event)
+        if channel is None:
+            await event.edit(
+                "❌ Usage:\n"
+                "`.settarget @username` — public channel\n"
+                "`.settarget -100xxxxxxxxxx` — channel ID (private ke liye)\n"
+                "Ya kisi bhi channel ka message forward karke us pe reply karo `.settarget`"
+            )
+            return
+    else:
+        channel = parse_channel_input(arg)
+        try:
+            entity = await client.get_entity(channel)
+        except Exception as e:
+            await event.edit(f"❌ Error: `{e}`")
+            return
+
+    state["target"] = channel
+    state["target_title"] = getattr(entity, "title", str(channel))
+    save_state(state)
+    await event.edit(f"✅ Target set: **{state['target_title']}**\n`{channel}`")
 
 
 @client.on(events.NewMessage(outgoing=True, pattern=r"^\.info$"))
@@ -280,8 +367,10 @@ async def bot_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "🤖 *Bot Commands:*\n\n"
-        "/setsource `@channel` — Source channel set karo\n"
-        "/settarget `@channel` — Target channel set karo\n"
+        "/setsource `@user / -100id / link` — Source set karo\n"
+        "/setsource (msg forward karke) — Private channel source set\n"
+        "/settarget `@user / -100id / link` — Target set karo\n"
+        "/settarget (msg forward karke) — Private channel target set\n"
         "/info — Current config dekho\n"
         "/sync — Full sync start karo\n"
         "/syncfrom `<id>` — Message ID se sync karo\n"
@@ -298,34 +387,95 @@ async def bot_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def bot_setsource(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not bot_is_owner(update):
         return
+    msg = update.message
+
+    # Option 1: Forwarded message se channel detect karo (no args needed)
     if not context.args:
-        await update.message.reply_text("❌ Usage: /setsource @channelname")
+        fwd_chat = getattr(msg.forward_from_chat, "id", None) if msg.forward_from_chat else None
+        if fwd_chat:
+            try:
+                entity = await client.get_entity(fwd_chat)
+                channel = fwd_chat
+                state["source"] = channel
+                state["source_title"] = getattr(entity, "title", str(channel))
+                save_state(state)
+                await msg.reply_text(
+                    f"✅ Source set: *{state['source_title']}*\n`{channel}`",
+                    parse_mode="Markdown"
+                )
+                return
+            except Exception as e:
+                await msg.reply_text(f"❌ Error: `{e}`", parse_mode="Markdown")
+                return
+        await msg.reply_text(
+            "❌ Usage:\n"
+            "`/setsource @username` — public channel\n"
+            "`/setsource -100xxxxxxxxxx` — channel ID (private ke liye)\n"
+            "Ya private channel ka koi message is chat mein forward karo, phir `/setsource` bina argument ke bhejo",
+            parse_mode="Markdown"
+        )
         return
-    channel = context.args[0].strip()
+
+    # Option 2: Argument diya gaya
+    channel = parse_channel_input(context.args[0])
     try:
         entity = await client.get_entity(channel)
         state["source"] = channel
-        state["source_title"] = getattr(entity, "title", channel)
+        state["source_title"] = getattr(entity, "title", str(channel))
         save_state(state)
-        await update.message.reply_text(f"✅ Source set: *{state['source_title']}*\n`{channel}`", parse_mode="Markdown")
+        await msg.reply_text(
+            f"✅ Source set: *{state['source_title']}*\n`{channel}`",
+            parse_mode="Markdown"
+        )
     except Exception as e:
-        await update.message.reply_text(f"❌ Error: `{e}`", parse_mode="Markdown")
+        await msg.reply_text(f"❌ Error: `{e}`", parse_mode="Markdown")
+
 
 async def bot_settarget(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not bot_is_owner(update):
         return
+    msg = update.message
+
+    # Option 1: Forwarded message se channel detect karo (no args needed)
     if not context.args:
-        await update.message.reply_text("❌ Usage: /settarget @channelname")
+        fwd_chat = getattr(msg.forward_from_chat, "id", None) if msg.forward_from_chat else None
+        if fwd_chat:
+            try:
+                entity = await client.get_entity(fwd_chat)
+                channel = fwd_chat
+                state["target"] = channel
+                state["target_title"] = getattr(entity, "title", str(channel))
+                save_state(state)
+                await msg.reply_text(
+                    f"✅ Target set: *{state['target_title']}*\n`{channel}`",
+                    parse_mode="Markdown"
+                )
+                return
+            except Exception as e:
+                await msg.reply_text(f"❌ Error: `{e}`", parse_mode="Markdown")
+                return
+        await msg.reply_text(
+            "❌ Usage:\n"
+            "`/settarget @username` — public channel\n"
+            "`/settarget -100xxxxxxxxxx` — channel ID (private ke liye)\n"
+            "Ya private channel ka koi message is chat mein forward karo, phir `/settarget` bina argument ke bhejo",
+            parse_mode="Markdown"
+        )
         return
-    channel = context.args[0].strip()
+
+    # Option 2: Argument diya gaya
+    channel = parse_channel_input(context.args[0])
     try:
         entity = await client.get_entity(channel)
         state["target"] = channel
-        state["target_title"] = getattr(entity, "title", channel)
+        state["target_title"] = getattr(entity, "title", str(channel))
         save_state(state)
-        await update.message.reply_text(f"✅ Target set: *{state['target_title']}*\n`{channel}`", parse_mode="Markdown")
+        await msg.reply_text(
+            f"✅ Target set: *{state['target_title']}*\n`{channel}`",
+            parse_mode="Markdown"
+        )
     except Exception as e:
-        await update.message.reply_text(f"❌ Error: `{e}`", parse_mode="Markdown")
+        await msg.reply_text(f"❌ Error: `{e}`", parse_mode="Markdown")
 
 async def bot_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not bot_is_owner(update):
