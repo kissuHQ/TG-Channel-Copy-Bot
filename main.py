@@ -13,15 +13,22 @@ import asyncio
 import json
 import logging
 import time
+import io
 from datetime import datetime, timedelta
 from pathlib import Path
-from dotenv import load_dotenv
-
 from telethon import TelegramClient, events
 from telethon.network import ConnectionTcpAbridged
 from telethon.tl.types import (
     MessageMediaPhoto, MessageMediaDocument,
-    MessageMediaWebPage
+    MessageMediaWebPage, DocumentAttributeFilename
+)
+from telethon.tl.types import (
+    InputMessagesFilterPhotos,
+    InputMessagesFilterVideo,
+    InputMessagesFilterDocument,
+    InputMessagesFilterGif,
+    InputMessagesFilterVoice,
+    InputMessagesFilterUrl,
 )
 from telethon.errors import (
     FloodWaitError, ChatWriteForbiddenError, ChannelPrivateError,
@@ -35,14 +42,18 @@ from telegram.ext import (
     Application, CommandHandler, ContextTypes
 )
 
-load_dotenv()
-
 # ─── CONFIG ───────────────────────────────────────────
-API_ID       = int(os.getenv("API_ID"))
-API_HASH     = os.getenv("API_HASH")
-PHONE        = os.getenv("PHONE")
-OWNER_ID     = int(os.getenv("OWNER_ID"))
-BOT_TOKEN    = os.getenv("BOT_TOKEN")
+def _require_env(key: str) -> str:
+    val = os.getenv(key)
+    if not val:
+        raise RuntimeError(f"Missing required environment variable: {key}. Set it in Replit Secrets.")
+    return val
+
+API_ID       = int(_require_env("API_ID"))
+API_HASH     = _require_env("API_HASH")
+PHONE        = _require_env("PHONE")
+OWNER_ID     = int(_require_env("OWNER_ID"))
+BOT_TOKEN    = _require_env("BOT_TOKEN")
 
 MSG_DELAY    = 1       # seconds between messages
 BATCH_SIZE   = 25      # messages per batch
@@ -319,19 +330,97 @@ async def cmd_settarget(event):
     await event.edit(f"✅ Target set: **{state['target_title']}**\n`{channel}`")
 
 
+async def _count_filter(entity, f):
+    """Return exact message count for a given filter using limit=0."""
+    try:
+        result = await client.get_messages(entity, limit=0, filter=f)
+        return result.total
+    except Exception:
+        return 0
+
+
+async def _fetch_channel_info(channel_id):
+    """Fetch exact message counts per type using Telegram's built-in filters."""
+    if not channel_id:
+        return None
+    try:
+        entity = await client.get_entity(channel_id)
+
+        # All counts fetched in parallel — each is a single fast API call
+        (
+            total,
+            photos,
+            videos,
+            docs,
+            gifs,
+            voice,
+            links,
+        ) = await asyncio.gather(
+            _count_filter(entity, None),                    # all messages
+            _count_filter(entity, InputMessagesFilterPhotos()),
+            _count_filter(entity, InputMessagesFilterVideo()),
+            _count_filter(entity, InputMessagesFilterDocument()),
+            _count_filter(entity, InputMessagesFilterGif()),
+            _count_filter(entity, InputMessagesFilterVoice()),
+            _count_filter(entity, InputMessagesFilterUrl()),
+        )
+
+        members = getattr(entity, "participants_count", None)
+        return {
+            "title":    getattr(entity, "title", str(channel_id)),
+            "username": getattr(entity, "username", None),
+            "total":    total,
+            "members":  members,
+            "photos":   photos,
+            "videos":   videos,
+            "docs":     docs,
+            "gifs":     gifs,
+            "voice":    voice,
+            "links":    links,
+        }
+    except Exception as e:
+        logger.warning(f"_fetch_channel_info error: {e}")
+        return None
+
+
+def _format_channel_block(info, label="Channel"):
+    if not info:
+        return f"{label}: ❌ Not set / unreachable"
+    uname   = f"@{info['username']}" if info.get("username") else ""
+    members = f"👥 Members: `{info['members']:,}`\n" if info.get("members") else ""
+    return (
+        f"**{info['title']}** {uname}\n"
+        f"📨 Total: `{info['total']:,}`\n"
+        f"{members}"
+        f"📷 Photos: `{info['photos']:,}`  🎬 Videos: `{info['videos']:,}`\n"
+        f"📄 Files: `{info['docs']:,}`  🔗 Links: `{info['links']:,}`\n"
+        f"🎞 GIFs: `{info['gifs']:,}`  🎙 Voice: `{info['voice']:,}`"
+    )
+
+
 @client.on(events.NewMessage(outgoing=True, pattern=r"^\.info$"))
 async def cmd_info(event):
     if not is_owner(event.sender_id):
         return
-    src = state.get("source_title", "❌ Not set")
-    tgt = state.get("target_title", "❌ Not set")
-    last = state.get("last_synced_id", 0)
+    await event.edit("🔍 Fetching channel info...")
+    src_id  = state.get("source")
+    tgt_id  = state.get("target")
+    last    = state.get("last_synced_id", 0)
     running = "🟢 Running" if state.get("running") else "🔴 Stopped"
-    paused = " (⏸️ Paused)" if state.get("paused") else ""
+    paused  = " (⏸️ Paused)" if state.get("paused") else ""
+
+    src_info, tgt_info = await asyncio.gather(
+        _fetch_channel_info(src_id),
+        _fetch_channel_info(tgt_id),
+    )
+
+    src_block = _format_channel_block(src_info, "Source") if src_id else "📥 Source: ❌ Not set"
+    tgt_block = _format_channel_block(tgt_info, "Target") if tgt_id else "📤 Target: ❌ Not set"
+
     await event.edit(
         f"📋 **Current Config**\n\n"
-        f"📥 Source: `{src}`\n"
-        f"📤 Target: `{tgt}`\n"
+        f"📥 **Source**\n{src_block}\n\n"
+        f"📤 **Target**\n{tgt_block}\n\n"
         f"🔢 Last synced ID: `{last}`\n"
         f"⚙️ Status: {running}{paused}"
     )
@@ -566,15 +655,29 @@ async def bot_settarget(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def bot_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not bot_is_owner(update):
         return
-    src = state.get("source_title", "❌ Not set")
-    tgt = state.get("target_title", "❌ Not set")
-    last = state.get("last_synced_id", 0)
+    await update.message.reply_text("🔍 Fetching channel info...", parse_mode="Markdown")
+    src_id  = state.get("source")
+    tgt_id  = state.get("target")
+    last    = state.get("last_synced_id", 0)
     running = "🟢 Running" if state.get("running") else "🔴 Stopped"
-    paused = " (⏸️ Paused)" if state.get("paused") else ""
+    paused  = " (⏸️ Paused)" if state.get("paused") else ""
+
+    src_info, tgt_info = await asyncio.gather(
+        _fetch_channel_info(src_id),
+        _fetch_channel_info(tgt_id),
+    )
+
+    src_block = _format_channel_block(src_info, "Source") if src_id else "❌ Not set"
+    tgt_block = _format_channel_block(tgt_info, "Target") if tgt_id else "❌ Not set"
+
+    # Markdown-safe version for Bot API (no bold via **)
+    src_block_md = src_block.replace("**", "*")
+    tgt_block_md = tgt_block.replace("**", "*")
+
     await update.message.reply_text(
         f"📋 *Current Config*\n\n"
-        f"📥 Source: `{src}`\n"
-        f"📤 Target: `{tgt}`\n"
+        f"📥 *Source*\n{src_block_md}\n\n"
+        f"📤 *Target*\n{tgt_block_md}\n\n"
         f"🔢 Last synced ID: `{last}`\n"
         f"⚙️ Status: {running}{paused}",
         parse_mode="Markdown"
@@ -1027,8 +1130,8 @@ async def send_message(target, message, on_progress=None):
     """
     Sequential send with optional progress callbacks.
     on_progress: async (phase: "download"|"upload", current: int, total: int)
-    - Media: parallel download → 512KB chunk upload
-    - Text: seedha bhejo
+    - Media: parallel download → 512KB chunk upload (original filename/ext preserved)
+    - Text: seedha bhejo, caption always with file (never separate)
     """
     if message.media and not isinstance(message.media, MessageMediaWebPage):
 
@@ -1042,8 +1145,26 @@ async def send_message(target, message, on_progress=None):
             raise Exception("Media download failed (empty buffer)")
 
         total_bytes = len(buf)
-        caption     = message.text or ""
+        # Caption always sent with the file (never as a separate message)
+        caption = message.text or ""
         logger.debug(f"Uploading {total_bytes//1024}KB with part_size_kb=512")
+
+        # ── Preserve original filename / extension ─────────
+        original_filename = None
+        if isinstance(message.media, MessageMediaDocument) and message.media.document:
+            for attr in message.media.document.attributes:
+                if isinstance(attr, DocumentAttributeFilename):
+                    original_filename = attr.file_name
+                    break
+
+        # Wrap bytes in BytesIO with original filename so Telethon preserves extension
+        if original_filename:
+            file_obj = io.BytesIO(buf)
+            file_obj.name = original_filename
+            force_doc = True   # send as document to keep exact extension
+        else:
+            file_obj = buf
+            force_doc = False  # photos stay as photos
 
         # ── Upload ────────────────────────────────────────
         async def ul_cb(current, total):
@@ -1052,10 +1173,10 @@ async def send_message(target, message, on_progress=None):
 
         await client.send_file(
             target,
-            file              = buf,
+            file              = file_obj,
             caption           = caption,
             parse_mode        = "md",
-            force_document    = False,
+            force_document    = force_doc,
             part_size_kb      = 512,
             progress_callback = ul_cb,
         )
