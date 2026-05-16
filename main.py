@@ -112,7 +112,7 @@ async def cmd_help(event):
         "`.pause` — Sync pause karo\n"
         "`.resume` — Sync resume karo\n"
         "`.stop` — Sync stop karo\n"
-        "`.status` — Live status dekho\n"
+        "`.status` — Live status dekho\n
         "`.reset` — Config reset karo\n"
         "`.help` — Ye menu\n\n"
         "⚠️ Sirf owner (tum) use kar sakte ho"
