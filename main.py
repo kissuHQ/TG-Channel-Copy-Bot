@@ -90,52 +90,59 @@ def save_state(state):
 
 state = load_state()
 
-# ─── FAST PARALLEL DOWNLOADER ─────────────────────────
+# ─── FAST PARALLEL DOWNLOADER (stride method) ─────────
 async def fast_download(media) -> bytes:
     """
-    Large files (documents/videos): PARALLEL_WORKERS goroutines,
-    har ek alag offset se CHUNK_SIZE blocks download karta hai → asyncio.gather.
-    Photos / small files: seedha bytes mein download (overhead nahi chahiye).
+    iter_download ka stride trick use karke true parallel MTProto download:
+
+    N workers, har ek stride=N*CHUNK_SIZE ke saath alag offset se shuru hota hai:
+      Worker 0 → chunks 0, N, 2N, 3N ...   (offset=0,            stride=N*CHUNK)
+      Worker 1 → chunks 1, N+1, 2N+1 ...   (offset=1*CHUNK,      stride=N*CHUNK)
+      Worker 2 → chunks 2, N+2, 2N+2 ...   (offset=2*CHUNK,      stride=N*CHUNK)
+      ...
+    asyncio.gather se sab ek saath → interleave → original file
+
+    Photo / small file (<2MB) → single download (overhead nahi chahiye)
     """
-    # Photo ya koi bhi non-document → simple download
     if not isinstance(media, MessageMediaDocument) or not media.document:
         return await client.download_media(media, file=bytes)
 
     total_size = media.document.size
 
-    # Chhoti file → parallel overhead se fayda nahi
     if total_size < SMALL_FILE_LIMIT:
+        logger.debug(f"Small file {total_size//1024}KB — single download")
         return await client.download_media(media, file=bytes)
 
-    # Chunks align to CHUNK_SIZE (Telegram requirement)
-    num_chunks  = (total_size + CHUNK_SIZE - 1) // CHUNK_SIZE
-    # Har worker kitne chunks handle karega
-    chunks_per_worker = max(1, (num_chunks + PARALLEL_WORKERS - 1) // PARALLEL_WORKERS)
+    stride = PARALLEL_WORKERS * CHUNK_SIZE
+    logger.debug(
+        f"Parallel stride download | size={total_size//1024}KB "
+        f"workers={PARALLEL_WORKERS} chunk={CHUNK_SIZE//1024}KB"
+    )
 
-    async def download_part(start_chunk: int) -> bytes:
-        """start_chunk index se le kar apna hissa download karo"""
-        offset      = start_chunk * CHUNK_SIZE
-        byte_limit  = min(chunks_per_worker * CHUNK_SIZE, total_size - offset)
-        if byte_limit <= 0:
-            return b""
+    async def worker(worker_id: int) -> list:
+        """Har worker apne assigned chunks download karta hai"""
         parts = []
         async for chunk in client.iter_download(
             media,
-            offset       = offset,
-            limit        = byte_limit,
+            offset       = worker_id * CHUNK_SIZE,
+            stride       = stride,
             request_size = CHUNK_SIZE,
         ):
             parts.append(chunk)
-        return b"".join(parts)
+        return parts
 
-    # Parallel tasks — ek time pe PARALLEL_WORKERS downloads
-    worker_starts = list(range(0, num_chunks, chunks_per_worker))
-    logger.debug(
-        f"Parallel download | size={total_size//1024}KB "
-        f"workers={len(worker_starts)} chunk={CHUNK_SIZE//1024}KB"
-    )
-    parts = await asyncio.gather(*[download_part(s) for s in worker_starts])
-    return b"".join(parts)
+    # Sab workers ek saath chalao
+    all_parts = await asyncio.gather(*[worker(i) for i in range(PARALLEL_WORKERS)])
+
+    # Interleave: [w0[0], w1[0], w2[0], w3[0], w0[1], w1[1], ...]
+    max_len = max((len(p) for p in all_parts), default=0)
+    result  = []
+    for i in range(max_len):
+        for w in all_parts:
+            if i < len(w):
+                result.append(w[i])
+
+    return b"".join(result)
 # ──────────────────────────────────────────────────────
 
 
