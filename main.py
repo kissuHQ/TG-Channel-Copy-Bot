@@ -11,7 +11,9 @@ Telegram Channel Archive Bot (Telethon Userbot + Bot API)
 import os
 import asyncio
 import json
-from datetime import datetime
+import logging
+import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -39,15 +41,37 @@ PHONE        = os.getenv("PHONE")
 OWNER_ID     = int(os.getenv("OWNER_ID"))
 BOT_TOKEN    = os.getenv("BOT_TOKEN")
 
-MSG_DELAY    = 4
-BATCH_SIZE   = 15
-BATCH_DELAY  = 90
+MSG_DELAY    = 1       # seconds between messages (was 4)
+BATCH_SIZE   = 25      # messages per batch (was 15)
+BATCH_DELAY  = 20      # seconds after each batch (was 90)
+LOG_FILE     = "sync.log"
 # ──────────────────────────────────────────────────────
 
 SESSION_FILE = "archive_session"
 STATE_FILE   = "sync_state.json"
 
-client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
+# ─── LOGGER SETUP ─────────────────────────────────────
+logger = logging.getLogger("SyncBot")
+logger.setLevel(logging.DEBUG)
+_fmt = logging.Formatter("[%(asctime)s] %(levelname)s — %(message)s", "%d-%b %H:%M:%S")
+
+_fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+_fh.setLevel(logging.DEBUG)
+_fh.setFormatter(_fmt)
+
+_ch = logging.StreamHandler()
+_ch.setLevel(logging.INFO)
+_ch.setFormatter(_fmt)
+
+logger.addHandler(_fh)
+logger.addHandler(_ch)
+# ──────────────────────────────────────────────────────
+
+client = TelegramClient(
+    SESSION_FILE, API_ID, API_HASH,
+    connection_retries=5,
+    retry_delay=2,
+)
 
 # ─── STATE MANAGEMENT ─────────────────────────────────
 def load_state():
@@ -645,15 +669,48 @@ async def start_sync_bot(progress_msg, reverse=True, min_id=0, limit=None):
     await _run_sync(progress_msg, source, target, reverse, min_id, limit, is_bot=True)
 
 
+def _make_progress_bar(done, total, width=14):
+    if total <= 0:
+        return "░" * width
+    filled = int(width * done / total)
+    return "▓" * filled + "░" * (width - filled)
+
+
+def _fmt_eta(seconds):
+    if seconds <= 0:
+        return "?"
+    td = timedelta(seconds=int(seconds))
+    h, rem = divmod(td.seconds, 3600)
+    m, s = divmod(rem, 60)
+    if td.days or h:
+        return f"{td.days*24+h}h {m}m"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
+TYPE_ICON = {
+    "text":  "📝",
+    "photo": "📷",
+    "video": "🎬",
+    "doc":   "📄",
+    "other": "📎",
+}
+
+
 async def _run_sync(progress_msg, source, target, reverse, min_id, limit, is_bot=False):
-    async def edit_msg(text):
+    async def edit_msg(text, parse_mode=None):
         try:
             if is_bot:
-                await progress_msg.edit_text(text)
+                kwargs = {"parse_mode": parse_mode} if parse_mode else {}
+                await progress_msg.edit_text(text, **kwargs)
             else:
-                await progress_msg.edit(text)
-        except:
+                await progress_msg.edit(text, parse_mode=parse_mode)
+        except Exception:
             pass
+
+    src_title  = state.get("source_title", str(source))
+    tgt_title  = state.get("target_title", str(target))
 
     try:
         source_entity = await client.get_entity(source)
@@ -664,16 +721,21 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit, is_bot
         state["total_msgs"] = total_count
         save_state(state)
 
+        start_time = time.time()
+        logger.info(f"Sync started | src={src_title} | tgt={tgt_title} | total={total_count}")
+
         await edit_msg(
-            f"Sync Started\n\n"
-            f"Source: {state.get('source_title', source)}\n"
-            f"Target: {state.get('target_title', target)}\n"
-            f"Total messages: {total_count}\n\nStarting..."
+            f"⚡ Sync शुरू हो गया!\n\n"
+            f"📥 Source: {src_title}\n"
+            f"📤 Target: {tgt_title}\n"
+            f"📊 Total: {total_count} messages\n\n"
+            f"Pehla message bheja ja raha hai..."
         )
 
-        count = 0
-        failed = 0
-        stats = reset_stats()
+        count   = 0
+        failed  = 0
+        stats   = reset_stats()
+        _last_edit = 0   # throttle edit calls (max 1 per sec)
 
         async for message in client.iter_messages(
             source_entity,
@@ -682,6 +744,7 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit, is_bot
             limit=limit
         ):
             if not state.get("running"):
+                logger.info("Sync stopped by user command")
                 break
 
             while state.get("paused"):
@@ -689,40 +752,72 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit, is_bot
                 state.update(load_state())
 
             try:
+                msg_type = get_msg_type(message)
+                logger.debug(
+                    f"Sending msg_id={message.id} type={msg_type}"
+                )
                 sent = await send_message(target_entity, message)
+
                 if sent:
                     count += 1
-                    msg_type = get_msg_type(message)
                     stats[msg_type] = stats.get(msg_type, 0) + 1
                     state["last_synced_id"] = message.id
-                    state["current_id"] = count
-                    state["stats"] = stats
+                    state["current_id"]     = count
+                    state["stats"]          = stats
                     save_state(state)
+                    logger.info(
+                        f"✅ Sent [{count}/{total_count}] id={message.id} type={msg_type}"
+                    )
 
-                    if count % 10 == 0:
-                        pct = f"{(count/total_count*100):.1f}%" if total_count else "?"
+                    # Live preview — update every message, max 1 edit/sec
+                    now = time.time()
+                    if now - _last_edit >= 1.0:
+                        _last_edit = now
+                        elapsed   = now - start_time
+                        speed     = count / (elapsed / 60) if elapsed > 0 else 0
+                        remaining = (total_count - count) / (speed / 60) if speed > 0 else 0
+                        pct       = count / total_count * 100 if total_count else 0
+                        bar       = _make_progress_bar(count, total_count)
+
                         await edit_msg(
-                            f"Syncing...\n\n"
-                            f"Progress: {count}/{total_count} ({pct})\n\n"
-                            f"{stats_text(stats)}"
+                            f"⚡ *Syncing...*\n\n"
+                            f"📥 `{src_title}`\n"
+                            f"📤 `{tgt_title}`\n\n"
+                            f"`{bar}` {pct:.1f}%\n"
+                            f"*{count}* / {total_count} msgs\n\n"
+                            f"{TYPE_ICON[msg_type]} Last: `#{message.id}`\n\n"
+                            f"📝 Text:  {stats['text']}   "
+                            f"📷 Photo: {stats['photo']}\n"
+                            f"🎬 Video: {stats['video']}   "
+                            f"📄 Doc:   {stats['doc']}\n"
+                            f"📎 Other: {stats['other']}   "
+                            f"❌ Failed: {stats['failed']}\n\n"
+                            f"🚀 Speed: {speed:.1f} msg/min\n"
+                            f"⏳ ETA:   {_fmt_eta(remaining)}\n"
+                            f"🕐 Started: {datetime.fromtimestamp(start_time).strftime('%I:%M %p')}",
+                            parse_mode="Markdown"
                         )
 
                     if count % BATCH_SIZE == 0:
+                        logger.info(f"Batch pause {BATCH_DELAY}s after {count} msgs")
                         await asyncio.sleep(BATCH_DELAY)
                     else:
                         await asyncio.sleep(MSG_DELAY)
 
             except FloodWaitError as e:
                 wait = e.seconds + 10
+                logger.warning(f"FloodWait {wait}s after msg_id={message.id}")
                 await edit_msg(
-                    f"FloodWait!\n\n"
-                    f"Telegram ne slow down karne kaha\n"
-                    f"Waiting: {wait} seconds\n\n"
-                    f"Progress: {count}/{total_count}"
+                    f"⏸️ *FloodWait!*\n\n"
+                    f"Telegram ne slow karne kaha\n"
+                    f"⏱ Wait: *{wait}s*\n\n"
+                    f"Progress: {count}/{total_count}",
+                    parse_mode="Markdown"
                 )
                 await asyncio.sleep(wait)
 
             except ChatWriteForbiddenError:
+                logger.error("ChatWriteForbiddenError — no write permission on target")
                 await edit_msg("❌ Target channel mein write permission nahi hai!")
                 state["running"] = False
                 save_state(state)
@@ -731,30 +826,45 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit, is_bot
             except Exception as e:
                 failed += 1
                 stats["failed"] = failed
-                state["stats"] = stats
+                state["stats"]  = stats
                 save_state(state)
-                print(f"❌ Message {message.id} failed: {e}")
+                logger.error(f"❌ msg_id={message.id} FAILED: {e}")
                 await asyncio.sleep(MSG_DELAY)
                 continue
 
+        elapsed_total = time.time() - start_time
         state["running"] = False
-        state["stats"] = stats
+        state["stats"]   = stats
         save_state(state)
+        logger.info(
+            f"Sync complete | sent={count} failed={failed} "
+            f"time={_fmt_eta(elapsed_total)}"
+        )
 
         await edit_msg(
-            f"✅ Sync Complete!\n\n"
-            f"Source: {state.get('source_title', source)}\n"
-            f"Target: {state.get('target_title', target)}\n\n"
-            f"{stats_text(stats)}\n\n"
-            f"{datetime.now().strftime('%d %b %Y, %I:%M %p')}"
+            f"✅ *Sync Complete!*\n\n"
+            f"📥 `{src_title}`\n"
+            f"📤 `{tgt_title}`\n\n"
+            f"📝 Text:  {stats['text']}   "
+            f"📷 Photo: {stats['photo']}\n"
+            f"🎬 Video: {stats['video']}   "
+            f"📄 Doc:   {stats['doc']}\n"
+            f"📎 Other: {stats['other']}   "
+            f"❌ Failed: {stats['failed']}\n"
+            f"📊 Total:  {count}\n\n"
+            f"⏱ Time: {_fmt_eta(elapsed_total)}\n"
+            f"🕐 {datetime.now().strftime('%d %b %Y, %I:%M %p')}",
+            parse_mode="Markdown"
         )
 
     except ChannelPrivateError:
+        logger.error("ChannelPrivateError — source is private or no access")
         state["running"] = False
         save_state(state)
         await edit_msg("❌ Source channel private hai ya access nahi hai!")
 
     except Exception as e:
+        logger.error(f"Fatal sync error: {e}")
         state["running"] = False
         save_state(state)
         await edit_msg(f"❌ Fatal error: {e}")
@@ -762,40 +872,24 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit, is_bot
 
 async def send_message(target, message):
     """
-    Ek message ek ek karke bhejo:
-    - Media ho to pehle download karo, phir caption ke saath upload karo
-    - Sirf text ho to seedha bhejo
-    - Dono kaam hone ke baad hi return karo (sequential)
+    Sequential send:
+    - Media: RAM mein download (no disk I/O) → caption ke saath upload
+    - Text: seedha bhejo
     """
-    import tempfile, os as _os
-
     if message.media and not isinstance(message.media, MessageMediaWebPage):
-        # Pehle media download karo temp file mein
-        tmp_path = None
-        downloaded = None
-        try:
-            with tempfile.NamedTemporaryFile(delete=False) as tmp:
-                tmp_path = tmp.name
-            downloaded = await client.download_media(message.media, file=tmp_path)
-            if not downloaded:
-                raise Exception("Media download failed (None returned)")
-            caption = message.text or ""
-            await client.send_file(
-                target,
-                file=downloaded,
-                caption=caption,
-                parse_mode="md",
-                force_document=False
-            )
-            return True
-        finally:
-            # Temp files cleanup
-            for fpath in {tmp_path, downloaded}:
-                if fpath and _os.path.exists(fpath):
-                    try:
-                        _os.remove(fpath)
-                    except Exception:
-                        pass
+        # bytes buffer use karo — temp file se 2-3x fast
+        buf = await client.download_media(message.media, file=bytes)
+        if not buf:
+            raise Exception("Media download failed (empty buffer)")
+        caption = message.text or ""
+        await client.send_file(
+            target,
+            file=buf,
+            caption=caption,
+            parse_mode="md",
+            force_document=False
+        )
+        return True
 
     elif message.text:
         await client.send_message(
