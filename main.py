@@ -18,6 +18,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from telethon import TelegramClient, events
+from telethon.network import ConnectionTcpAbridged
 from telethon.tl.types import (
     MessageMediaPhoto, MessageMediaDocument,
     MessageMediaWebPage
@@ -41,11 +42,10 @@ PHONE        = os.getenv("PHONE")
 OWNER_ID     = int(os.getenv("OWNER_ID"))
 BOT_TOKEN    = os.getenv("BOT_TOKEN")
 
-MSG_DELAY    = 1       # seconds between messages (was 4)
-BATCH_SIZE   = 25      # messages per batch (was 15)
-BATCH_DELAY  = 20      # seconds after each batch (was 90)
+MSG_DELAY    = 1       # seconds between messages
+BATCH_SIZE   = 25      # messages per batch
+BATCH_DELAY  = 20      # seconds after each batch
 LOG_FILE     = "sync.log"
-# ──────────────────────────────────────────────────────
 
 SESSION_FILE = "archive_session"
 STATE_FILE   = "sync_state.json"
@@ -67,14 +67,15 @@ logger.addHandler(_fh)
 logger.addHandler(_ch)
 # ──────────────────────────────────────────────────────
 
-CHUNK_SIZE       = 512 * 1024   # 512 KB per chunk (Telegram max)
-PARALLEL_WORKERS = 4             # parallel chunk download threads
-SMALL_FILE_LIMIT = 2 * 1024 * 1024  # files < 2 MB: no parallel needed
+CHUNK_SIZE       = 512 * 1024       # 512 KB per chunk (Telegram max)
+PARALLEL_WORKERS = 8                # parallel chunk download workers (user set)
+SMALL_FILE_LIMIT = 2 * 1024 * 1024  # files < 2 MB: single download
 
 client = TelegramClient(
     SESSION_FILE, API_ID, API_HASH,
-    connection_retries=5,
-    retry_delay=2,
+    connection            = ConnectionTcpAbridged,  # fastest transport
+    connection_retries    = 5,
+    retry_delay           = 2,
 )
 
 # ─── STATE MANAGEMENT ─────────────────────────────────
@@ -989,6 +990,18 @@ async def main():
     me = await client.get_me()
     print(f"✅ Userbot logged in as: {me.first_name} (@{me.username})")
     print(f"🔐 Owner ID: {OWNER_ID}")
+
+    # Crypto backend confirm karo
+    try:
+        import cryptg
+        ver = getattr(cryptg, "__version__", "installed")
+        print(f"⚡ Crypto: cryptg {ver} (AES-NI hardware — FAST)")
+        logger.info(f"Crypto backend: cryptg {ver} (AES-NI)")
+    except ImportError:
+        print("⚠️  Crypto: pyaes (pure Python — slow, cryptg install karo)")
+        logger.warning("Crypto backend: pyaes (slow)")
+
+    print(f"🔧 Workers: {PARALLEL_WORKERS} | Chunk: {CHUNK_SIZE//1024}KB | Connection: TcpAbridged")
 
     # Build Telegram Bot
     app = Application.builder().token(BOT_TOKEN).build()
