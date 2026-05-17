@@ -62,8 +62,8 @@ BOT_TOKEN    = _require_env("BOT_TOKEN")
 SESSION_STRING = os.getenv("SESSION_STRING", "")  # env var se lega
 
 
-MSG_DELAY    = 4       # seconds between messages
-BATCH_SIZE   = 2      # messages per batch
+MSG_DELAY    = 3        # seconds between messages
+BATCH_SIZE   = 10      # messages per batch
 BATCH_DELAY  = 10      # seconds after each batch
 
 LOG_FILE     = "sync.log"
@@ -88,7 +88,7 @@ logger.addHandler(_fh)
 logger.addHandler(_ch)
 
 # ── Live log ring buffer (web dashboard reads this) ────
-_live_log: deque = deque(maxlen=200)
+_live_log: deque = deque(maxlen=5000)
 
 def _log_live(msg: str):
     """Append timestamped entry to the in-memory live log."""
@@ -105,8 +105,8 @@ _llh.setLevel(logging.INFO)
 logger.addHandler(_llh)
 # ──────────────────────────────────────────────────────
 
-CHUNK_SIZE       = 128 * 1024       # kept for reference (disk download use karta hai)
-PARALLEL_WORKERS = 1                # disk mode mein 1 worker kaafi hai
+CHUNK_SIZE       = 512 * 1024       # kept for reference (disk download use karta hai)
+PARALLEL_WORKERS = 8                # disk mode mein 1 worker kaafi hai
 SMALL_FILE_LIMIT = 5 * 1024 * 1024  # unused in disk mode
 
 client = TelegramClient(
@@ -994,8 +994,8 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit, is_bot
                     "speed":    speed_str,
                 }
 
-                # ── Live log update every 0.5s ───────────────
-                if now - _prog_last_live[0] >= 0.5:
+                # ── Live log update every 2s ───────────────
+                if now - _prog_last_live[0] >= 2:
                     _prog_last_live[0] = now
                     bar = _mini_bar(pct)
                     _log_live(
@@ -1217,61 +1217,91 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit, is_bot
 
 
 async def send_message(target, message, on_progress=None):
-    """
-    Disk-based send: download → /tmp → upload → delete.
-    RAM mein kabhi poori file nahi aati.
-    """
     if message.media and not isinstance(message.media, MessageMediaWebPage):
 
-        # ── Download to disk ──────────────────────────────
         async def dl_cb(current, total):
             if on_progress:
                 await on_progress("download", current, total)
 
         tmp_path = await fast_download(message.media, progress_cb=dl_cb if on_progress else None)
-
         if not tmp_path or not Path(tmp_path).exists():
-            raise Exception("Media download failed (empty file)")
+            raise Exception("Media download failed")
 
         caption = message.text or ""
+        send_path = Path(tmp_path)
 
-        # ── Preserve original filename ─────────────────────
+        # ── Type detect karo ──────────────────────────────
         original_filename = None
+        mime = ""
+        attributes = []
+
         if isinstance(message.media, MessageMediaDocument) and message.media.document:
-            for attr in message.media.document.attributes:
+            doc = message.media.document
+            mime = getattr(doc, "mime_type", "")
+            attributes = doc.attributes or []
+            for attr in attributes:
                 if isinstance(attr, DocumentAttributeFilename):
                     original_filename = attr.file_name
                     break
 
-        force_doc = bool(original_filename)
-        send_path = Path(tmp_path)
+        is_video = "video" in mime
+        is_audio = "audio" in mime or "ogg" in mime
+        is_photo = isinstance(message.media, MessageMediaPhoto)
 
-        # Rename tmp file to original name if available
+        # Rename to original filename if available
         if original_filename:
             named_path = Path("/tmp") / original_filename
             send_path.rename(named_path)
             send_path = named_path
 
-        total_bytes = send_path.stat().st_size
-        logger.debug(f"Uploading {total_bytes//1024}KB from disk: {send_path.name}")
+        logger.debug(f"Uploading {send_path.stat().st_size//1024}KB | mime={mime} | file={send_path.name}")
 
-        # ── Upload ────────────────────────────────────────
         async def ul_cb(current, total):
             if on_progress:
                 await on_progress("upload", current, total)
 
         try:
-            await client.send_file(
-                target,
-                file              = str(send_path),
-                caption           = caption,
-                parse_mode        = "md",
-                force_document    = force_doc,
-                part_size_kb      = 512,
-                progress_callback = ul_cb,
-            )
+            if is_photo:
+                # Photo as photo
+                await client.send_file(
+                    target, str(send_path),
+                    caption=caption, parse_mode="md",
+                    force_document=False,
+                    part_size_kb=1024,
+                    progress_callback=ul_cb,
+                )
+            elif is_video:
+                # Video as streamable video (not document)
+                await client.send_file(
+                    target, str(send_path),
+                    caption=caption, parse_mode="md",
+                    force_document=False,   # streamable video
+                    supports_streaming=True,
+                    attributes=attributes,  # original duration/dimensions preserve
+                    part_size_kb=1024,
+                    progress_callback=ul_cb,
+                )
+            elif is_audio:
+                # Audio as audio player
+                await client.send_file(
+                    target, str(send_path),
+                    caption=caption, parse_mode="md",
+                    force_document=False,
+                    attributes=attributes,  # title/duration preserve
+                    part_size_kb=1024,
+                    progress_callback=ul_cb,
+                )
+            else:
+                # PDF, CSV, ZIP, etc — document as document
+                await client.send_file(
+                    target, str(send_path),
+                    caption=caption, parse_mode="md",
+                    force_document=True,
+                    attributes=attributes,
+                    part_size_kb=1024,
+                    progress_callback=ul_cb,
+                )
         finally:
-            # Disk se delete karo — chahe upload succeed ho ya fail
             try:
                 send_path.unlink(missing_ok=True)
             except Exception:
@@ -1281,15 +1311,12 @@ async def send_message(target, message, on_progress=None):
 
     elif message.text:
         await client.send_message(
-            target,
-            message.text,
-            parse_mode   = "md",
-            link_preview = False
+            target, message.text,
+            parse_mode="md", link_preview=False
         )
         return True
 
     return False
-
 
 def get_msg_type(message) -> str:
     if not message.media or isinstance(message.media, MessageMediaWebPage):
