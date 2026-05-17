@@ -15,6 +15,7 @@ import logging
 import time
 import io
 import threading
+import tempfile
 from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -104,9 +105,9 @@ _llh.setLevel(logging.INFO)
 logger.addHandler(_llh)
 # ──────────────────────────────────────────────────────
 
-CHUNK_SIZE       = 128 * 1024       # 512 KB per chunk (Telegram max)
-PARALLEL_WORKERS = 2                # parallel chunk download workers (user set)
-SMALL_FILE_LIMIT = 5 * 1024 * 1024  # files < 2 MB: single download
+CHUNK_SIZE       = 128 * 1024       # kept for reference (disk download use karta hai)
+PARALLEL_WORKERS = 1                # disk mode mein 1 worker kaafi hai
+SMALL_FILE_LIMIT = 5 * 1024 * 1024  # unused in disk mode
 
 client = TelegramClient(
     StringSession(SESSION_STRING), API_ID, API_HASH,
@@ -128,58 +129,50 @@ def save_state(state):
 
 state = load_state()
 
-# ─── FAST PARALLEL DOWNLOADER (stride method) ─────────
-async def fast_download(media, progress_cb=None) -> bytes:
+# ─── DISK-BASED DOWNLOADER (RAM bachane ke liye) ──────
+async def fast_download(media, progress_cb=None) -> str:
     """
-    Stride-based parallel download + optional progress_cb(current, total).
-    Photo / small file (<2MB) → single download.
+    File ko RAM mein nahi, disk (/tmp) pe download karta hai.
+    Returns: tmp file path (str). Caller ka zimma hai delete karna.
     """
-    if not isinstance(media, MessageMediaDocument) or not media.document:
-        return await client.download_media(media, file=bytes)
+    # Temp file banao
+    suffix = ".tmp"
+    if isinstance(media, MessageMediaDocument) and media.document:
+        for attr in media.document.attributes:
+            if isinstance(attr, DocumentAttributeFilename):
+                ext = Path(attr.file_name).suffix
+                if ext:
+                    suffix = ext
+                break
+        else:
+            mime = getattr(media.document, "mime_type", "")
+            if "video" in mime:   suffix = ".mp4"
+            elif "audio" in mime: suffix = ".mp3"
+    elif isinstance(media, MessageMediaPhoto):
+        suffix = ".jpg"
 
-    total_size = media.document.size
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=suffix, dir="/tmp")
+    os.close(tmp_fd)
 
-    if total_size < SMALL_FILE_LIMIT:
-        logger.debug(f"Small file {total_size//1024}KB — single download")
-        return await client.download_media(media, file=bytes)
+    total_size = 0
+    if isinstance(media, MessageMediaDocument) and media.document:
+        total_size = media.document.size
 
-    stride      = PARALLEL_WORKERS * CHUNK_SIZE
-    downloaded  = [0]          # shared mutable counter (asyncio single-thread safe)
-    _last_cb    = [0.0]        # throttle: max 1 progress_cb call per 0.5s
+    downloaded = [0]
+    _last_cb   = [0.0]
 
-    logger.debug(
-        f"Parallel stride download | size={total_size//1024}KB "
-        f"workers={PARALLEL_WORKERS} chunk={CHUNK_SIZE//1024}KB"
-    )
+    logger.debug(f"Disk download → {tmp_path} | size={total_size//1024}KB")
 
-    async def worker(worker_id: int) -> list:
-        parts = []
-        async for chunk in client.iter_download(
-            media,
-            offset       = worker_id * CHUNK_SIZE,
-            stride       = stride,
-            request_size = CHUNK_SIZE,
-        ):
-            parts.append(chunk)
-            downloaded[0] += len(chunk)
-            if progress_cb:
-                now = time.time()
-                if now - _last_cb[0] >= 0.5:
-                    _last_cb[0] = now
-                    await progress_cb(downloaded[0], total_size)
-        return parts
+    async def _progress(current, total):
+        downloaded[0] = current
+        if progress_cb:
+            now = time.time()
+            if now - _last_cb[0] >= 0.5:
+                _last_cb[0] = now
+                await progress_cb(current, total or total_size)
 
-    all_parts = await asyncio.gather(*[worker(i) for i in range(PARALLEL_WORKERS)])
-
-    # Interleave: w0[0], w1[0], w2[0], ..., w0[1], w1[1], ...
-    max_len = max((len(p) for p in all_parts), default=0)
-    result  = []
-    for i in range(max_len):
-        for w in all_parts:
-            if i < len(w):
-                result.append(w[i])
-
-    return b"".join(result)
+    await client.download_media(media, file=tmp_path, progress_callback=_progress)
+    return tmp_path
 # ──────────────────────────────────────────────────────
 
 
@@ -1225,28 +1218,24 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit, is_bot
 
 async def send_message(target, message, on_progress=None):
     """
-    Sequential send with optional progress callbacks.
-    on_progress: async (phase: "download"|"upload", current: int, total: int)
-    - Media: parallel download → 512KB chunk upload (original filename/ext preserved)
-    - Text: seedha bhejo, caption always with file (never separate)
+    Disk-based send: download → /tmp → upload → delete.
+    RAM mein kabhi poori file nahi aati.
     """
     if message.media and not isinstance(message.media, MessageMediaWebPage):
 
-        # ── Download ──────────────────────────────────────
+        # ── Download to disk ──────────────────────────────
         async def dl_cb(current, total):
             if on_progress:
                 await on_progress("download", current, total)
 
-        buf = await fast_download(message.media, progress_cb=dl_cb if on_progress else None)
-        if not buf:
-            raise Exception("Media download failed (empty buffer)")
+        tmp_path = await fast_download(message.media, progress_cb=dl_cb if on_progress else None)
 
-        total_bytes = len(buf)
-        # Caption always sent with the file (never as a separate message)
+        if not tmp_path or not Path(tmp_path).exists():
+            raise Exception("Media download failed (empty file)")
+
         caption = message.text or ""
-        logger.debug(f"Uploading {total_bytes//1024}KB with part_size_kb=512")
 
-        # ── Preserve original filename / extension ─────────
+        # ── Preserve original filename ─────────────────────
         original_filename = None
         if isinstance(message.media, MessageMediaDocument) and message.media.document:
             for attr in message.media.document.attributes:
@@ -1254,29 +1243,40 @@ async def send_message(target, message, on_progress=None):
                     original_filename = attr.file_name
                     break
 
-        # Wrap bytes in BytesIO with original filename so Telethon preserves extension
+        force_doc = bool(original_filename)
+        send_path = Path(tmp_path)
+
+        # Rename tmp file to original name if available
         if original_filename:
-            file_obj = io.BytesIO(buf)
-            file_obj.name = original_filename
-            force_doc = True   # send as document to keep exact extension
-        else:
-            file_obj = buf
-            force_doc = False  # photos stay as photos
+            named_path = Path("/tmp") / original_filename
+            send_path.rename(named_path)
+            send_path = named_path
+
+        total_bytes = send_path.stat().st_size
+        logger.debug(f"Uploading {total_bytes//1024}KB from disk: {send_path.name}")
 
         # ── Upload ────────────────────────────────────────
         async def ul_cb(current, total):
             if on_progress:
                 await on_progress("upload", current, total)
 
-        await client.send_file(
-            target,
-            file              = file_obj,
-            caption           = caption,
-            parse_mode        = "md",
-            force_document    = force_doc,
-            part_size_kb      = 512,
-            progress_callback = ul_cb,
-        )
+        try:
+            await client.send_file(
+                target,
+                file              = str(send_path),
+                caption           = caption,
+                parse_mode        = "md",
+                force_document    = force_doc,
+                part_size_kb      = 512,
+                progress_callback = ul_cb,
+            )
+        finally:
+            # Disk se delete karo — chahe upload succeed ho ya fail
+            try:
+                send_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
         return True
 
     elif message.text:
