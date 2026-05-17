@@ -14,8 +14,11 @@ import json
 import logging
 import time
 import io
+import threading
+from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
+from flask import Flask, render_template, jsonify, request
 from telethon import TelegramClient, events
 from telethon.network import ConnectionTcpAbridged
 from telethon.tl.types import (
@@ -58,6 +61,7 @@ BOT_TOKEN    = _require_env("BOT_TOKEN")
 MSG_DELAY    = 1       # seconds between messages
 BATCH_SIZE   = 25      # messages per batch
 BATCH_DELAY  = 20      # seconds after each batch
+
 LOG_FILE     = "sync.log"
 
 SESSION_FILE = "archive_session"
@@ -78,6 +82,23 @@ _ch.setFormatter(_fmt)
 
 logger.addHandler(_fh)
 logger.addHandler(_ch)
+
+# ── Live log ring buffer (web dashboard reads this) ────
+_live_log: deque = deque(maxlen=200)
+
+def _log_live(msg: str):
+    """Append timestamped entry to the in-memory live log."""
+    ts = datetime.now().strftime("%H:%M:%S")
+    _live_log.append(f"[{ts}] {msg}")
+
+class _LiveLogHandler(logging.Handler):
+    """Mirror every logger record into _live_log for the web dashboard."""
+    def emit(self, record):
+        _log_live(f"[{record.levelname}] {record.getMessage()}")
+
+_llh = _LiveLogHandler()
+_llh.setLevel(logging.INFO)
+logger.addHandler(_llh)
 # ──────────────────────────────────────────────────────
 
 CHUNK_SIZE       = 512 * 1024       # 512 KB per chunk (Telegram max)
@@ -888,6 +909,7 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit, is_bot
 
         start_time = time.time()
         logger.info(f"Sync started | src={src_title} | tgt={tgt_title} | total={total_count}")
+        _log_live(f"🚀 Sync shuru | {src_title} → {tgt_title} | {total_count} messages")
 
         await edit_msg(
             f"⚡ Sync शुरू हो गया!\n\n"
@@ -916,44 +938,101 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit, is_bot
                 await asyncio.sleep(2)
                 state.update(load_state())
 
-            # ── Progress callback (logs + bot preview) ────────
-            _prog_last_edit = [0.0]
-            _prog_last_log  = [-1]   # last logged pct (avoid duplicate logs)
+            # ── Progress callback (live log + bot preview) ────
+            _prog_last_live  = [0.0]   # last _live_log update time
+            _prog_last_edit  = [0.0]   # last bot-message edit time
+            _prog_last_log10 = [-1]    # last 10% milestone logged to file
+            _prog_spd_time   = [time.time()]  # speed window start
+            _prog_spd_bytes  = [0]            # bytes at speed window start
+
+            def _fname_from_msg(msg):
+                if isinstance(msg.media, MessageMediaDocument) and msg.media.document:
+                    for attr in msg.media.document.attributes:
+                        if isinstance(attr, DocumentAttributeFilename):
+                            return attr.file_name
+                    mime = getattr(msg.media.document, "mime_type", "")
+                    if "video" in mime:   return f"video_{msg.id}.mp4"
+                    if "audio" in mime:   return f"audio_{msg.id}.mp3"
+                    return f"file_{msg.id}"
+                if isinstance(msg.media, MessageMediaPhoto):
+                    return f"photo_{msg.id}.jpg"
+                return f"file_{msg.id}"
+
+            def _fmt_speed(bps: float) -> str:
+                if bps >= 1_048_576:  return f"{bps/1_048_576:.2f} MB/s"
+                if bps >= 1024:       return f"{bps/1024:.1f} KB/s"
+                return f"{bps:.0f} B/s"
+
+            def _mini_bar(pct, w=10):
+                filled = int(w * pct / 100)
+                return "█" * filled + "░" * (w - filled)
 
             async def on_progress(phase: str, current: int, total: int):
                 if total <= 0:
                     return
+                now      = time.time()
                 pct      = int(current / total * 100)
-                size_mb  = total / 1024 / 1024
+                cur_mb   = current / 1_048_576
+                tot_mb   = total   / 1_048_576
                 icon     = "📥" if phase == "download" else "📤"
-                phase_lbl = "Download" if phase == "download" else "Upload"
+                phase_lbl = "Downloading" if phase == "download" else "Uploading"
 
-                # Log every 25% (once per milestone)
-                milestone = (pct // 25) * 25
-                if milestone != _prog_last_log[0] and pct >= milestone:
-                    _prog_last_log[0] = milestone
+                # ── Instant transfer speed (sliding window) ──
+                dt = now - _prog_spd_time[0]
+                if dt >= 0.5:
+                    bps = (current - _prog_spd_bytes[0]) / dt
+                    _prog_spd_time[0]  = now
+                    _prog_spd_bytes[0] = current
+                    speed_str = _fmt_speed(max(bps, 0))
+                else:
+                    speed_str = "…"
+
+                # ── Update state["transfer"] for /api/status ─
+                fname = _fname_from_msg(message)
+                state["transfer"] = {
+                    "phase":    phase_lbl,
+                    "file":     fname,
+                    "pct":      pct,
+                    "cur_mb":   round(cur_mb, 2),
+                    "tot_mb":   round(tot_mb, 2),
+                    "speed":    speed_str,
+                }
+
+                # ── Live log update every 0.5s ───────────────
+                if now - _prog_last_live[0] >= 0.5:
+                    _prog_last_live[0] = now
+                    bar = _mini_bar(pct)
+                    _log_live(
+                        f"{icon} {phase_lbl}: {fname} "
+                        f"[{bar}] {pct}% "
+                        f"({cur_mb:.1f}/{tot_mb:.1f} MB) "
+                        f"⚡ {speed_str}"
+                    )
+
+                # ── File log every 10% milestone ─────────────
+                milestone = (pct // 10) * 10
+                if milestone != _prog_last_log10[0] and pct >= milestone and milestone > 0:
+                    _prog_last_log10[0] = milestone
                     logger.info(
-                        f"  {icon} {phase_lbl} {milestone}% "
-                        f"({current//1024}KB / {total//1024}KB) "
+                        f"{icon} {phase_lbl} {milestone}% "
+                        f"({cur_mb:.1f}/{tot_mb:.1f} MB) {speed_str} "
                         f"msg_id={message.id}"
                     )
 
-                # Bot edit throttle — max 1 edit per 4s during transfer
-                now = time.time()
+                # ── Bot message edit every 4s during transfer ─
                 if now - _prog_last_edit[0] >= 4.0:
                     _prog_last_edit[0] = now
-                    bar = _make_progress_bar(pct, 100, width=12)
                     elapsed  = now - start_time
-                    speed    = count / (elapsed / 60) if elapsed > 0 else 0
+                    msg_spd  = count / (elapsed / 60) if elapsed > 0 else 0
                     await edit_msg(
                         f"⚡ *Syncing...*\n\n"
                         f"📥 `{src_title}`\n"
                         f"📤 `{tgt_title}`\n\n"
                         f"📊 Msgs: *{count}* / {total_count}\n\n"
-                        f"{icon} *{phase_lbl}ing file...*\n"
-                        f"`{bar}` {pct}%\n"
-                        f"📦 {current/1024/1024:.1f} / {size_mb:.1f} MB\n\n"
-                        f"🚀 Speed: {speed:.1f} msg/min",
+                        f"{icon} *{phase_lbl}...*\n"
+                        f"`{_make_progress_bar(pct, 100, 12)}` {pct}%\n"
+                        f"📦 {cur_mb:.1f} / {tot_mb:.1f} MB  ⚡ {speed_str}\n\n"
+                        f"🚀 {msg_spd:.1f} msg/min",
                         parse_mode="Markdown"
                     )
             # ─────────────────────────────────────────────────
@@ -987,7 +1066,12 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit, is_bot
                     state["last_synced_id"] = message.id
                     state["current_id"]     = count
                     state["stats"]          = stats
+                    state.pop("transfer", None)   # clear transfer card
                     save_state(state)
+                    _log_live(
+                        f"✅ [{count}/{total_count}] ID={message.id} "
+                        f"{TYPE_ICON.get(msg_type, '📎')} {msg_type}"
+                    )
                     logger.info(
                         f"✅ Sent [{count}/{total_count}] id={message.id} type={msg_type}"
                     )
@@ -1057,11 +1141,12 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit, is_bot
                 return
 
             except (FileReferenceExpiredError, MediaInvalidError) as e:
-                # Media expired ya invalid — skip karo, count nahi badhe ga
                 failed += 1
                 stats["failed"] = failed
                 state["stats"]  = stats
+                state.pop("transfer", None)
                 save_state(state)
+                _log_live(f"⏭️ Skipped ID={message.id} — media unavailable: {type(e).__name__}")
                 logger.warning(
                     f"⏭️ Skipped msg_id={message.id} — media unavailable: {type(e).__name__}"
                 )
@@ -1069,11 +1154,13 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit, is_bot
                 continue
 
             except BadMessageError as e:
-                logger.error(f"BadMessageError msg_id={message.id}: {e}")
                 failed += 1
                 stats["failed"] = failed
                 state["stats"]  = stats
+                state.pop("transfer", None)
                 save_state(state)
+                _log_live(f"❌ BadMessage ID={message.id}: {e}")
+                logger.error(f"BadMessageError msg_id={message.id}: {e}")
                 await asyncio.sleep(MSG_DELAY)
                 continue
 
@@ -1081,7 +1168,9 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit, is_bot
                 failed += 1
                 stats["failed"] = failed
                 state["stats"]  = stats
+                state.pop("transfer", None)
                 save_state(state)
+                _log_live(f"❌ Failed ID={message.id} [{type(e).__name__}]: {str(e)[:80]}")
                 logger.error(
                     f"❌ msg_id={message.id} FAILED [{type(e).__name__}]: {e}"
                 )
@@ -1091,7 +1180,12 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit, is_bot
         elapsed_total = time.time() - start_time
         state["running"] = False
         state["stats"]   = stats
+        state.pop("transfer", None)
         save_state(state)
+        _log_live(
+            f"🏁 Sync complete! ✅ {count} sent  ❌ {failed} failed  "
+            f"⏱ {_fmt_eta(elapsed_total)}"
+        )
         logger.info(
             f"Sync complete | sent={count} failed={failed} "
             f"time={_fmt_eta(elapsed_total)}"
@@ -1209,10 +1303,187 @@ def get_msg_type(message) -> str:
 
 
 # ════════════════════════════════════════════════════════
+#  FLASK WEB SERVER (keeps Replit alive + full dashboard)
+# ════════════════════════════════════════════════════════
+
+flask_app  = Flask(__name__)
+_start_time = time.time()
+_loop: asyncio.AbstractEventLoop = None   # set in main()
+
+
+# ── Async helpers ──────────────────────────────────────
+
+class WebEvent:
+    """Dummy Telegram event for web-triggered sync operations."""
+    async def edit(self, text):  logger.info(f"[WEB] {str(text)[:200]}")
+    async def reply(self, text): logger.info(f"[WEB] {str(text)[:200]}")
+
+
+def _run_async(coro, timeout=25):
+    """Run a coroutine from Flask (sync thread) and return result."""
+    future = asyncio.run_coroutine_threadsafe(coro, _loop)
+    return future.result(timeout=timeout)
+
+
+def _run_bg(coro):
+    """Fire-and-forget a coroutine from Flask (no wait)."""
+    asyncio.run_coroutine_threadsafe(coro, _loop)
+
+
+async def _set_source(channel_input):
+    ch = parse_channel_input(channel_input)
+    entity = await client.get_entity(ch)
+    state["source"] = ch
+    state["source_title"] = getattr(entity, "title", str(ch))
+    save_state(state)
+    return {"ok": True, "title": state["source_title"]}
+
+
+async def _set_target(channel_input):
+    ch = parse_channel_input(channel_input)
+    entity = await client.get_entity(ch)
+    state["target"] = ch
+    state["target_title"] = getattr(entity, "title", str(ch))
+    save_state(state)
+    return {"ok": True, "title": state["target_title"]}
+
+
+# ── Routes ─────────────────────────────────────────────
+
+@flask_app.route("/")
+def index():
+    return render_template("index.html")
+
+
+@flask_app.route("/api/status")
+def api_status():
+    running = state.get("running", False)
+    paused  = state.get("paused", False)
+    stats   = state.get("stats", {})
+    cur     = state.get("current_id", 0)
+    tot     = state.get("total_msgs", 0)
+    elapsed = int(time.time() - _start_time)
+    h, rem  = divmod(elapsed, 3600)
+    m, s    = divmod(rem, 60)
+    return jsonify({
+        "running": running,
+        "paused":  paused,
+        "source":  state.get("source_title", ""),
+        "target":  state.get("target_title", ""),
+        "last_id": state.get("last_synced_id", 0),
+        "current": cur,
+        "total":   tot,
+        "pct":     round(cur / tot * 100, 1) if tot else 0,
+        "stats":    stats,
+        "transfer": state.get("transfer"),
+        "uptime":   f"{h}h {m}m {s}s" if h else f"{m}m {s}s",
+    })
+
+
+@flask_app.route("/api/setsource", methods=["POST"])
+def api_setsource():
+    ch = (request.json or {}).get("channel", "").strip()
+    if not ch:
+        return jsonify({"ok": False, "error": "Channel required"})
+    try:
+        return jsonify(_run_async(_set_source(ch)))
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@flask_app.route("/api/settarget", methods=["POST"])
+def api_settarget():
+    ch = (request.json or {}).get("channel", "").strip()
+    if not ch:
+        return jsonify({"ok": False, "error": "Channel required"})
+    try:
+        return jsonify(_run_async(_set_target(ch)))
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@flask_app.route("/api/sync", methods=["POST"])
+def api_sync():
+    if state.get("running"):
+        return jsonify({"ok": False, "error": "Already running"})
+    _run_bg(start_sync_userbot(WebEvent(), reverse=True, min_id=0))
+    return jsonify({"ok": True})
+
+
+@flask_app.route("/api/syncfrom", methods=["POST"])
+def api_syncfrom():
+    if state.get("running"):
+        return jsonify({"ok": False, "error": "Already running"})
+    mid = int((request.json or {}).get("min_id", 0))
+    _run_bg(start_sync_userbot(WebEvent(), reverse=True, min_id=mid))
+    return jsonify({"ok": True})
+
+
+@flask_app.route("/api/synclast", methods=["POST"])
+def api_synclast():
+    if state.get("running"):
+        return jsonify({"ok": False, "error": "Already running"})
+    n = int((request.json or {}).get("n", 10))
+    _run_bg(start_sync_userbot(WebEvent(), reverse=False, limit=n))
+    return jsonify({"ok": True})
+
+
+@flask_app.route("/api/pause", methods=["POST"])
+def api_pause():
+    state["paused"] = True
+    save_state(state)
+    return jsonify({"ok": True})
+
+
+@flask_app.route("/api/resume", methods=["POST"])
+def api_resume():
+    state["paused"] = False
+    save_state(state)
+    return jsonify({"ok": True})
+
+
+@flask_app.route("/api/stop", methods=["POST"])
+def api_stop():
+    state["running"] = False
+    state["paused"]  = False
+    save_state(state)
+    return jsonify({"ok": True})
+
+
+@flask_app.route("/api/reset", methods=["POST"])
+def api_reset():
+    state.clear()
+    save_state(state)
+    return jsonify({"ok": True})
+
+
+@flask_app.route("/api/logs")
+def api_logs():
+    return jsonify({"logs": list(_live_log)})
+
+
+@flask_app.route("/health")
+def health():
+    return jsonify({"status": "ok", "running": state.get("running", False)})
+
+
+def run_flask():
+    flask_app.run(host="0.0.0.0", port=8080, debug=False, use_reloader=False)
+
+
+# ════════════════════════════════════════════════════════
 #  MAIN — Run both userbot + bot together
 # ════════════════════════════════════════════════════════
 
 async def main():
+    global _loop
+    _loop = asyncio.get_event_loop()
+
+    # Start Flask web server in background thread
+    t = threading.Thread(target=run_flask, daemon=True)
+    t.start()
+    print("🌐 Web dashboard running on port 8080")
+
     # Start Telethon userbot
     await client.start(phone=PHONE)
     me = await client.get_me()
