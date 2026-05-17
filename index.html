@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Archive Bot Dashboard</title>
+  <link rel="stylesheet" href="/static/style.css"/>
+</head>
+<body>
+
+<div class="layout">
+
+  <!-- HEADER -->
+  <header>
+    <div class="header-left">
+      <span class="logo">🤖</span>
+      <div>
+        <h1>Archive Bot</h1>
+        <span class="sub">Telegram Channel Copier</span>
+      </div>
+    </div>
+    <div id="global-status" class="badge off">
+      <span class="dot off"></span><span id="status-label">Offline</span>
+    </div>
+  </header>
+
+  <!-- TOAST -->
+  <div id="toast"></div>
+
+  <!-- STAT CARDS -->
+  <section class="cards">
+    <div class="card">
+      <div class="card-icon">📨</div>
+      <div class="card-info">
+        <span class="card-val" id="c-copied">0</span>
+        <span class="card-lbl">Copied</span>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-icon">❌</div>
+      <div class="card-info">
+        <span class="card-val" id="c-failed">0</span>
+        <span class="card-lbl">Failed</span>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-icon">📊</div>
+      <div class="card-info">
+        <span class="card-val" id="c-pct">0%</span>
+        <span class="card-lbl">Progress</span>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-icon">⏱</div>
+      <div class="card-info">
+        <span class="card-val" id="c-uptime">0m 0s</span>
+        <span class="card-lbl">Uptime</span>
+      </div>
+    </div>
+  </section>
+
+  <div class="main-grid">
+
+    <!-- LEFT COLUMN -->
+    <div class="col">
+
+      <!-- CHANNEL CONFIG -->
+      <div class="panel">
+        <div class="panel-title">📡 Channel Config</div>
+        <label class="field-label">Source Channel</label>
+        <div class="input-row">
+          <input id="src-input" type="text" placeholder="@username or -100xxxxxxxxxx"/>
+          <button onclick="setChannel('source')">Set</button>
+        </div>
+        <div class="channel-name" id="src-name">—</div>
+
+        <label class="field-label" style="margin-top:16px">Target Channel</label>
+        <div class="input-row">
+          <input id="tgt-input" type="text" placeholder="@username or -100xxxxxxxxxx"/>
+          <button onclick="setChannel('target')">Set</button>
+        </div>
+        <div class="channel-name" id="tgt-name">—</div>
+      </div>
+
+      <!-- SYNC CONTROLS -->
+      <div class="panel">
+        <div class="panel-title">⚙️ Sync Controls</div>
+
+        <div class="btn-group">
+          <button class="btn-primary" onclick="syncAction('sync')">▶ Full Sync</button>
+          <button class="btn-warn" onclick="syncAction('pause')">⏸ Pause</button>
+          <button class="btn-warn" onclick="syncAction('resume')">▶ Resume</button>
+        </div>
+        <div class="btn-group" style="margin-top:10px">
+          <button class="btn-danger" onclick="syncAction('stop')">⏹ Stop</button>
+          <button class="btn-danger" onclick="resetBot()">🔄 Reset</button>
+        </div>
+
+        <div class="divider"></div>
+
+        <label class="field-label">Sync From Message ID</label>
+        <div class="input-row">
+          <input id="syncfrom-input" type="number" placeholder="Message ID"/>
+          <button onclick="syncFrom()">Go</button>
+        </div>
+
+        <label class="field-label" style="margin-top:12px">Sync Last N Messages</label>
+        <div class="input-row">
+          <input id="synclast-input" type="number" placeholder="Number of messages"/>
+          <button onclick="syncLast()">Go</button>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- RIGHT COLUMN -->
+    <div class="col">
+
+      <!-- PROGRESS -->
+      <div class="panel">
+        <div class="panel-title">🔄 Live Progress</div>
+        <div id="sync-status-text" class="sync-status-text">🔴 Stopped</div>
+        <div class="progress-wrap">
+          <div class="progress-bar" id="progress-bar" style="width:0%"></div>
+        </div>
+        <div class="progress-labels">
+          <span id="prog-cur">0</span>
+          <span id="prog-pct">0%</span>
+          <span id="prog-tot">0</span>
+        </div>
+        <div class="field-label" style="margin-top:12px">Last Synced ID: <strong id="last-id">0</strong></div>
+
+        <!-- LIVE TRANSFER CARD -->
+        <div id="transfer-card" class="xfer-card" style="display:none">
+          <div class="xfer-header">
+            <span id="xfer-phase" class="xfer-phase">Downloading</span>
+            <span id="xfer-speed" class="xfer-speed">⚡ —</span>
+          </div>
+          <div class="xfer-file" id="xfer-file">—</div>
+          <div class="xfer-bar-wrap">
+            <div class="xfer-bar-fill" id="xfer-bar" style="width:0%"></div>
+          </div>
+          <div class="xfer-meta">
+            <span id="xfer-size">0 / 0 MB</span>
+            <span id="xfer-pct">0%</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- MEDIA STATS -->
+      <div class="panel">
+        <div class="panel-title">📊 Media Stats</div>
+        <div class="stats-grid">
+          <div class="stat-item"><span class="stat-icon">📷</span><span class="stat-val" id="s-photo">0</span><span class="stat-lbl">Photos</span></div>
+          <div class="stat-item"><span class="stat-icon">🎬</span><span class="stat-val" id="s-video">0</span><span class="stat-lbl">Videos</span></div>
+          <div class="stat-item"><span class="stat-icon">📄</span><span class="stat-val" id="s-doc">0</span><span class="stat-lbl">Docs</span></div>
+          <div class="stat-item"><span class="stat-icon">📝</span><span class="stat-val" id="s-text">0</span><span class="stat-lbl">Text</span></div>
+          <div class="stat-item"><span class="stat-icon">📎</span><span class="stat-val" id="s-other">0</span><span class="stat-lbl">Other</span></div>
+          <div class="stat-item"><span class="stat-icon">❌</span><span class="stat-val" id="s-failed">0</span><span class="stat-lbl">Failed</span></div>
+        </div>
+      </div>
+
+      <!-- ACTIVITY LOG -->
+      <div class="panel">
+        <div class="panel-title">📋 Activity Log <button class="log-clear" onclick="clearLog()">Clear</button></div>
+        <div id="log-box"></div>
+      </div>
+
+    </div>
+  </div>
+
+  <footer>Last updated: <span id="last-updated">—</span></footer>
+</div>
+
+<script src="/static/script.js"></script>
+</body>
+</html>
