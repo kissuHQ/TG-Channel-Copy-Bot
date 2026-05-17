@@ -62,8 +62,8 @@ SESSION_STRING = os.getenv("SESSION_STRING", "")  # env var se lega
 
 
 MSG_DELAY    = 4       # seconds between messages
-BATCH_SIZE   = 10      # messages per batch
-BATCH_DELAY  = 30      # seconds after each batch
+BATCH_SIZE   = 2      # messages per batch
+BATCH_DELAY  = 10      # seconds after each batch
 
 LOG_FILE     = "sync.log"
 
@@ -105,7 +105,7 @@ logger.addHandler(_llh)
 # ──────────────────────────────────────────────────────
 
 CHUNK_SIZE       = 128 * 1024       # 512 KB per chunk (Telegram max)
-PARALLEL_WORKERS = 4                # parallel chunk download workers (user set)
+PARALLEL_WORKERS = 2                # parallel chunk download workers (user set)
 SMALL_FILE_LIMIT = 5 * 1024 * 1024  # files < 2 MB: single download
 
 client = TelegramClient(
