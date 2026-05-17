@@ -39,11 +39,12 @@ from telethon.errors import (
     SlowModeWaitError, BadMessageError, TimeoutError as TgTimeoutError,
     ServerError,
 )
-
 from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, ContextTypes
 )
+from telethon.sessions import StringSession
+
 
 # ─── CONFIG ───────────────────────────────────────────
 def _require_env(key: str) -> str:
@@ -57,9 +58,11 @@ API_HASH     = _require_env("API_HASH")
 PHONE        = _require_env("PHONE")
 OWNER_ID     = int(_require_env("OWNER_ID"))
 BOT_TOKEN    = _require_env("BOT_TOKEN")
+SESSION_STRING = os.getenv("SESSION_STRING", "")  # env var se lega
 
-MSG_DELAY    = 1       # seconds between messages
-BATCH_SIZE   = 25      # messages per batch
+
+MSG_DELAY    = 4       # seconds between messages
+BATCH_SIZE   = 15      # messages per batch
 BATCH_DELAY  = 20      # seconds after each batch
 
 LOG_FILE     = "sync.log"
@@ -106,10 +109,10 @@ PARALLEL_WORKERS = 8                # parallel chunk download workers (user set)
 SMALL_FILE_LIMIT = 2 * 1024 * 1024  # files < 2 MB: single download
 
 client = TelegramClient(
-    SESSION_FILE, API_ID, API_HASH,
-    connection            = ConnectionTcpAbridged,  # fastest transport
-    connection_retries    = 5,
-    retry_delay           = 2,
+    StringSession(SESSION_STRING), API_ID, API_HASH,
+    connection         = ConnectionTcpAbridged,
+    connection_retries = 5,
+    retry_delay        = 2,
 )
 
 # ─── STATE MANAGEMENT ─────────────────────────────────
@@ -1468,8 +1471,8 @@ def health():
 
 
 def run_flask():
-    flask_app.run(host="0.0.0.0", port=8080, debug=False, use_reloader=False)
-
+    port = int(os.environ.get("PORT", 8080))
+    flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
 # ════════════════════════════════════════════════════════
 #  MAIN — Run both userbot + bot together
