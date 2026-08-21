@@ -19,7 +19,7 @@ import tempfile
 from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
-from flask import Flask, render_template, jsonify, request
+from flask import Flask, Response, render_template, jsonify, request, stream_with_context
 from telethon import TelegramClient, events
 from telethon.network import ConnectionTcpAbridged
 from telethon.tl.types import (
@@ -45,6 +45,18 @@ from telegram.ext import (
     Application, CommandHandler, ContextTypes
 )
 from telethon.sessions import StringSession
+
+
+_dashboard_condition = threading.Condition()
+_dashboard_revision = 0
+
+
+def _dashboard_changed():
+    """Wake dashboard SSE clients after a meaningful state/log change."""
+    global _dashboard_revision
+    with _dashboard_condition:
+        _dashboard_revision += 1
+        _dashboard_condition.notify_all()
 
 
 # ─── CONFIG ───────────────────────────────────────────
@@ -94,6 +106,7 @@ def _log_live(msg: str):
     """Append timestamped entry to the in-memory live log."""
     ts = datetime.now().strftime("%H:%M:%S")
     _live_log.append(f"[{ts}] {msg}")
+    _dashboard_changed()
 
 class _LiveLogHandler(logging.Handler):
     """Mirror every logger record into _live_log for the web dashboard."""
@@ -126,6 +139,7 @@ def load_state():
 def save_state(state):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
+    _dashboard_changed()
 
 state = load_state()
 
@@ -940,6 +954,7 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit, is_bot
             _prog_last_log10 = [-1]    # last 10% milestone logged to file
             _prog_spd_time   = [time.time()]  # speed window start
             _prog_spd_bytes  = [0]            # bytes at speed window start
+            _prog_last_dashboard = [0.0]      # dashboard push throttle
 
             def _fname_from_msg(msg):
                 if isinstance(msg.media, MessageMediaDocument) and msg.media.document:
@@ -993,6 +1008,9 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit, is_bot
                     "tot_mb":   round(tot_mb, 2),
                     "speed":    speed_str,
                 }
+                if now - _prog_last_dashboard[0] >= 0.5:
+                    _prog_last_dashboard[0] = now
+                    _dashboard_changed()
 
                 # ── Live log update every 2s ───────────────
                 if now - _prog_last_live[0] >= 2:
@@ -1385,8 +1403,12 @@ def index():
     return render_template("index.html")
 
 
-@flask_app.route("/api/status")
-def api_status():
+@flask_app.route("/favicon.ico")
+def favicon():
+    return Response(status=204)
+
+
+def _status_payload():
     running = state.get("running", False)
     paused  = state.get("paused", False)
     stats   = state.get("stats", {})
@@ -1395,7 +1417,7 @@ def api_status():
     elapsed = int(time.time() - _start_time)
     h, rem  = divmod(elapsed, 3600)
     m, s    = divmod(rem, 60)
-    return jsonify({
+    return {
         "running": running,
         "paused":  paused,
         "source":  state.get("source_title", ""),
@@ -1404,10 +1426,62 @@ def api_status():
         "current": cur,
         "total":   tot,
         "pct":     round(cur / tot * 100, 1) if tot else 0,
-        "stats":    stats,
+        "stats":   stats,
         "transfer": state.get("transfer"),
-        "uptime":   f"{h}h {m}m {s}s" if h else f"{m}m {s}s",
-    })
+        "uptime_seconds": elapsed,
+        "uptime": f"{h}h {m}m {s}s" if h else f"{m}m {s}s",
+    }
+
+
+def _dashboard_payload():
+    return {
+        "status": _status_payload(),
+        "logs": list(_live_log),
+    }
+
+
+@flask_app.route("/api/status")
+def api_status():
+    return jsonify(_status_payload())
+
+
+@flask_app.route("/api/bootstrap")
+def api_bootstrap():
+    """One initial dashboard snapshot; later changes arrive over SSE."""
+    return jsonify(_dashboard_payload())
+
+
+@flask_app.route("/api/events")
+def api_events():
+    """Push dashboard snapshots only when state or logs actually change."""
+    @stream_with_context
+    def stream():
+        last_revision = -1
+        while True:
+            with _dashboard_condition:
+                if last_revision == _dashboard_revision:
+                    _dashboard_condition.wait(timeout=25)
+                current_revision = _dashboard_revision
+
+            if current_revision == last_revision:
+                # Keep proxies from closing a healthy idle stream. This is
+                # not a dashboard request and carries no data update.
+                yield ": keep-alive\n\n"
+                continue
+
+            last_revision = current_revision
+            payload = json.dumps(_dashboard_payload(), ensure_ascii=False)
+            yield f"event: dashboard\ndata: {payload}\nid: {last_revision}\n\n"
+
+    return Response(
+        stream(),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @flask_app.route("/api/setsource", methods=["POST"])

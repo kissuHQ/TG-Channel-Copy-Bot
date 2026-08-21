@@ -15,11 +15,19 @@ async function api(path, body = null) {
   return res.json();
 }
 
-// ── Status polling ─────────────────────────────────────
-async function refreshStatus() {
-  let data;
-  try { data = await api('/api/status'); } catch { return; }
+// ── Change-driven dashboard updates ────────────────────
+let _serverUptime = 0;
+let _uptimeReceivedAt = 0;
 
+function formatUptime(totalSeconds) {
+  const seconds = Math.max(0, Math.floor(totalSeconds));
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
+  return h ? `${h}h ${m}m ${s}s` : `${m}m ${s}s`;
+}
+
+function renderStatus(data) {
   // Header badge
   const badge = document.getElementById('global-status');
   const dot   = badge.querySelector('.dot');
@@ -35,7 +43,9 @@ async function refreshStatus() {
   document.getElementById('c-copied').textContent  = copied;
   document.getElementById('c-failed').textContent  = stats.failed || 0;
   document.getElementById('c-pct').textContent     = data.pct + '%';
-  document.getElementById('c-uptime').textContent  = data.uptime;
+  _serverUptime = data.uptime_seconds || 0;
+  _uptimeReceivedAt = Date.now();
+  document.getElementById('c-uptime').textContent = data.uptime || formatUptime(_serverUptime);
 
   // Progress section
   const progText = data.paused ? '⏸️ Paused'
@@ -78,9 +88,6 @@ async function refreshStatus() {
   document.getElementById('last-updated').textContent = new Date().toLocaleTimeString();
 }
 
-// ── Live log polling ───────────────────────────────────
-let _logLen = 0;
-
 function _logClass(line) {
   if (line.includes('📥') || line.includes('Downloading')) return 'dl';
   if (line.includes('📤') || line.includes('Uploading'))   return 'ul';
@@ -95,13 +102,7 @@ function _logClass(line) {
   return '';
 }
 
-async function refreshLogs() {
-  let data;
-  try { data = await api('/api/logs'); } catch { return; }
-  const lines = data.logs || [];
-  if (lines.length === _logLen) return;
-  _logLen = lines.length;
-
+function renderLogs(lines) {
   const box = document.getElementById('log-box');
   box.innerHTML = '';
   lines.forEach(line => {
@@ -115,7 +116,31 @@ async function refreshLogs() {
 
 function clearLog() {
   document.getElementById('log-box').innerHTML = '';
-  _logLen = 0;
+}
+
+function applyDashboard(payload) {
+  if (payload.status) renderStatus(payload.status);
+  if (payload.logs) renderLogs(payload.logs);
+}
+
+async function loadDashboard() {
+  try {
+    const data = await api('/api/bootstrap');
+    applyDashboard(data);
+  } catch {
+    toast('Dashboard connection failed', true);
+  }
+}
+
+function connectDashboard() {
+  const events = new EventSource('/api/events');
+  events.addEventListener('dashboard', event => {
+    try { applyDashboard(JSON.parse(event.data)); } catch { /* reconnect handles transport errors */ }
+  });
+  events.onerror = () => {
+    // EventSource reconnects automatically; no polling fallback is needed.
+    document.getElementById('status-label').textContent = 'Reconnecting...';
+  };
 }
 
 // ── Channel set ────────────────────────────────────────
@@ -169,7 +194,11 @@ async function resetBot() {
 }
 
 // ── Init ───────────────────────────────────────────────
-refreshStatus();
-refreshLogs();
-setInterval(refreshStatus, 2500);
-setInterval(refreshLogs, 1500);   // live log har 1.5s
+loadDashboard();
+connectDashboard();
+setInterval(() => {
+  // Only the local clock moves; no request is made.
+  const elapsed = (Date.now() - _uptimeReceivedAt) / 1000;
+  document.getElementById('c-uptime').textContent =
+    formatUptime(_serverUptime + elapsed);
+}, 1000);
