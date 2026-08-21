@@ -1,6 +1,4 @@
 telethon
-python-telegram-bot
+python-telegram-bot==22.8
 flask
 cryptg
-python-telegram-bot
-telegram

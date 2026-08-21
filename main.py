@@ -1235,6 +1235,17 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit, is_bot
 
 
 async def send_message(target, message, on_progress=None):
+    # Telegram can often reuse the source media directly. This creates a new
+    # message without a forward header and avoids download/upload round trips.
+    # Restricted or otherwise non-copyable messages fall back to the existing
+    # disk-based path below.
+    try:
+        await client.send_message(target, message, parse_mode="md", link_preview=False)
+        logger.info(f"⚡ Copied directly msg_id={message.id} (no forward tag)")
+        return True
+    except Exception as copy_error:
+        logger.debug(f"Direct copy unavailable for msg_id={message.id}: {copy_error}")
+
     if message.media and not isinstance(message.media, MessageMediaWebPage):
 
         async def dl_cb(current, total):
@@ -1417,7 +1428,10 @@ def _status_payload():
     elapsed = int(time.time() - _start_time)
     h, rem  = divmod(elapsed, 3600)
     m, s    = divmod(rem, 60)
+    connected = client.is_connected()
     return {
+        "connected": connected,
+        "connection_label": "Connected" if connected else "Offline",
         "running": running,
         "paused":  paused,
         "source":  state.get("source_title", ""),

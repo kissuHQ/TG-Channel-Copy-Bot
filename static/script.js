@@ -32,10 +32,10 @@ function renderStatus(data) {
   const badge = document.getElementById('global-status');
   const dot   = badge.querySelector('.dot');
   const lbl   = document.getElementById('status-label');
-  const on    = data.running;
+  const on    = data.connected;
   badge.className = 'badge ' + (on ? 'on' : 'off');
   dot.className   = 'dot '  + (on ? 'on' : 'off');
-  lbl.textContent = data.paused ? 'Paused' : (on ? 'Running' : 'Offline');
+  lbl.textContent = data.paused && data.running ? 'Paused' : (on ? 'Connected' : 'Offline');
 
   // Stat cards
   const stats = data.stats || {};
@@ -49,7 +49,7 @@ function renderStatus(data) {
 
   // Progress section
   const progText = data.paused ? '⏸️ Paused'
-                 : on          ? `🔄 Syncing... ${data.current} / ${data.total}`
+                 : data.running ? `🔄 Syncing... ${data.current} / ${data.total}`
                                : '🔴 Stopped';
   document.getElementById('sync-status-text').textContent = progText;
   document.getElementById('progress-bar').style.width = data.pct + '%';
@@ -61,7 +61,7 @@ function renderStatus(data) {
   // Live transfer card
   const xfer = data.transfer;
   const xferCard = document.getElementById('transfer-card');
-  if (xfer && on) {
+  if (xfer && data.running) {
     xferCard.style.display = 'block';
     document.getElementById('xfer-phase').textContent = xfer.phase;
     document.getElementById('xfer-file').textContent  = xfer.file;

@@ -1,0 +1,19 @@
+{
+  "source": -1002718041215,
+  "source_title": "CineVerse Hub Official",
+  "target": -1003594349284,
+  "target_title": "CineVerse Hub Backup",
+  "paused": false,
+  "running": false,
+  "stats": {
+    "text": 2,
+    "photo": 1,
+    "video": 0,
+    "doc": 1,
+    "other": 0,
+    "failed": 0
+  },
+  "current_id": 4,
+  "total_msgs": 1649,
+  "last_synced_id": 356
+}
