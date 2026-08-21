@@ -12,6 +12,7 @@ import asyncio
 import getpass
 import os
 import sys
+from pathlib import Path
 
 from pyrogram import Client
 from pyrogram.errors import (
@@ -73,13 +74,19 @@ async def generate_session() -> None:
 
         session_string = await client.export_session_string()
         me = await client.get_me()
+        output_file = Path(
+            os.getenv("SESSION_OUTPUT_FILE", "session_string.txt")
+        ).expanduser()
+        output_file.write_text(session_string + "\n", encoding="utf-8")
+        output_file.chmod(0o600)
 
         print("\nLogin successful.")
         print(f"Account: {me.first_name or ''} {me.last_name or ''}".strip())
+        print(f"Session string saved to: {output_file}")
         print("\n--- SESSION STRING (copy only this value) ---")
         print(session_string)
         print("--- END SESSION STRING ---")
-        print("\nIs workflow ko stop kar sakte hain; ye session file disk par save nahi hui.")
+        print("\nIs workflow ko stop kar sakte hain. File private permissions ke saath save hui hai.")
     except FloodWait as exc:
         raise RuntimeError(
             f"Telegram FloodWait: {exc.value} seconds wait karke dobara try karein."
