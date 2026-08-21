@@ -5,6 +5,7 @@ stack = "BEST_EFFORT_FALLBACK"
 
 [nix]
 channel = "stable-25_05"
+packages = ["cargo", "libiconv", "openssl", "rustc"]
 
 [workflows]
 runButton = "Project"
@@ -28,6 +29,15 @@ args = "python main.py"
 
 [workflows.workflow.metadata]
 outputType = "console"
+
+[[workflows.workflow]]
+name = "session"
+mode = "parallel"
+author = 63571679
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "python main2.py"
 
 [[ports]]
 localPort = 8080
