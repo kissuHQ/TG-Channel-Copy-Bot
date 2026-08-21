@@ -2,6 +2,5 @@ telethon
 python-telegram-bot
 flask
 cryptg
-pyrogram
+python-telegram-bot
 telegram
-tgcrypto

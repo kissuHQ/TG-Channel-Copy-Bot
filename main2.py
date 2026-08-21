@@ -1,9 +1,8 @@
 """
-Standalone Pyrogram session-string generator.
+Standalone Telethon session-string generator for main.py.
 
-This file intentionally has no imports from the main application. Run it from
-the separate "session" workflow, enter the Telegram OTP in the console, and
-copy the generated string into the project that uses Pyrogram.
+This utility is intentionally separate from the main bot. The generated value
+matches Telethon's StringSession format used by main.py.
 """
 
 from __future__ import annotations
@@ -14,13 +13,14 @@ import os
 import sys
 from pathlib import Path
 
-from pyrogram import Client
-from pyrogram.errors import (
-    FloodWait,
-    PhoneCodeExpired,
-    PhoneCodeInvalid,
-    SessionPasswordNeeded,
+from telethon import TelegramClient
+from telethon.errors import (
+    FloodWaitError,
+    PhoneCodeExpiredError,
+    PhoneCodeInvalidError,
+    SessionPasswordNeededError,
 )
+from telethon.sessions import StringSession
 
 
 def required_env(name: str) -> str:
@@ -35,44 +35,36 @@ def required_env(name: str) -> str:
 async def generate_session() -> None:
     try:
         api_id = int(required_env("API_ID"))
-        api_hash = required_env("API_HASH")
     except ValueError as exc:
         raise RuntimeError("API_ID must be a number.") from exc
-
+    api_hash = required_env("API_HASH")
     phone = os.getenv("PHONE", "").strip() or input(
         "Telegram phone number (with country code, e.g. +91...): "
     ).strip()
     if not phone:
         raise RuntimeError("Phone number is required.")
 
-    # in_memory=True means this utility never creates a local .session file.
-    client = Client(
-        "session_generator",
-        api_id=api_id,
-        api_hash=api_hash,
-        in_memory=True,
-        device_model="Replit Session Generator",
-        app_version="1.0",
-    )
+    client = TelegramClient(StringSession(), api_id, api_hash)
 
     try:
         await client.connect()
-        sent_code = await client.send_code(phone)
-        print("\nOTP Telegram app/SMS par bheja gaya hai.")
-        code = input("OTP code: ").strip().replace(" ", "")
+        if await client.is_user_authorized():
+            print("Existing authorized session found; exporting it.")
+        else:
+            await client.send_code_request(phone)
+            print("\nOTP Telegram app/SMS par bheja gaya hai.")
+            code = input("OTP code: ").strip().replace(" ", "")
+            try:
+                await client.sign_in(phone=phone, code=code)
+            except SessionPasswordNeededError:
+                print("Telegram 2-step verification enabled hai.")
+                await client.sign_in(password=getpass.getpass("Telegram 2FA password: "))
+            except PhoneCodeInvalidError as exc:
+                raise RuntimeError("OTP code galat hai. Workflow dobara run karein.") from exc
+            except PhoneCodeExpiredError as exc:
+                raise RuntimeError("OTP expire ho gaya. Workflow dobara run karein.") from exc
 
-        try:
-            await client.sign_in(phone, sent_code.phone_code_hash, code)
-        except SessionPasswordNeeded:
-            print("Telegram 2-step verification enabled hai.")
-            password = getpass.getpass("Telegram 2FA password: ")
-            await client.check_password(password)
-        except PhoneCodeInvalid as exc:
-            raise RuntimeError("OTP code galat hai. Workflow dobara run karein.") from exc
-        except PhoneCodeExpired as exc:
-            raise RuntimeError("OTP expire ho gaya. Workflow dobara run karein.") from exc
-
-        session_string = await client.export_session_string()
+        session_string = client.session.save()
         me = await client.get_me()
         output_file = Path(
             os.getenv("SESSION_OUTPUT_FILE", "session_string.txt")
@@ -80,20 +72,18 @@ async def generate_session() -> None:
         output_file.write_text(session_string + "\n", encoding="utf-8")
         output_file.chmod(0o600)
 
-        print("\nLogin successful.")
+        print("\nTelethon login successful.")
         print(f"Account: {me.first_name or ''} {me.last_name or ''}".strip())
-        print(f"Session string saved to: {output_file}")
+        print(f"Telethon session string saved to: {output_file}")
         print("\n--- SESSION STRING (copy only this value) ---")
         print(session_string)
         print("--- END SESSION STRING ---")
-        print("\nIs workflow ko stop kar sakte hain. File private permissions ke saath save hui hai.")
-    except FloodWait as exc:
+    except FloodWaitError as exc:
         raise RuntimeError(
-            f"Telegram FloodWait: {exc.value} seconds wait karke dobara try karein."
+            f"Telegram FloodWait: {exc.seconds} seconds wait karke dobara try karein."
         ) from exc
     finally:
-        if client.is_connected:
-            await client.disconnect()
+        await client.disconnect()
 
 
 def main() -> int:
