@@ -94,6 +94,29 @@
         <div class="auto-stats">Auto copied: <strong id="auto-sent">0</strong> · Failed: <strong id="auto-failed">0</strong></div>
       </div>
 
+      <div class="panel">
+        <div class="panel-title">🔗 Source → Target Pairs</div>
+        <div class="input-row"><input id="pair-name" placeholder="Pair name"/></div>
+        <div class="input-row pair-input"><input id="pair-source" placeholder="Source @username / -100id"/></div>
+        <div class="input-row pair-input"><input id="pair-target" placeholder="Target @username / -100id"/></div>
+        <input id="pair-include" class="wide-input" placeholder="Include keywords: movie, course"/>
+        <input id="pair-exclude" class="wide-input" placeholder="Exclude keywords: spam, ad"/>
+        <input id="pair-prefix" class="wide-input" placeholder="Caption prefix"/>
+        <input id="pair-suffix" class="wide-input" placeholder="Caption suffix"/>
+        <div class="check-grid">
+          <label><input id="pair-links" type="checkbox"/> Remove links</label>
+          <label><input id="pair-source-name" type="checkbox"/> Remove source name</label>
+        </div>
+        <div class="type-grid">
+          <label><input class="pair-type" type="checkbox" value="text" checked/> Text</label>
+          <label><input class="pair-type" type="checkbox" value="photo" checked/> Photos</label>
+          <label><input class="pair-type" type="checkbox" value="video" checked/> Videos</label>
+          <label><input class="pair-type" type="checkbox" value="doc" checked/> Documents</label>
+        </div>
+        <button class="btn-primary full-btn" onclick="addPair()">Add pair</button>
+        <div id="pair-list" class="task-list"><div class="hint">No pairs yet.</div></div>
+      </div>
+
       <!-- SYNC CONTROLS -->
       <div class="panel">
         <div class="panel-title">⚙️ Sync Controls</div>
@@ -121,6 +144,16 @@
         <div class="input-row">
           <input id="synclast-input" type="number" placeholder="Number of messages"/>
           <button onclick="syncLast()">Go</button>
+        </div>
+        <div class="divider"></div>
+        <label class="field-label">Create task for pair</label>
+        <div class="input-row">
+          <select id="task-pair"></select>
+          <select id="task-mode"><option value="full">Full sync</option><option value="last">Last N</option><option value="from_id">From ID</option></select>
+        </div>
+        <div class="input-row">
+          <input id="task-limit" type="number" placeholder="N / message ID (optional)"/>
+          <button class="btn-primary" onclick="createTask()">Add task</button>
         </div>
       </div>
 

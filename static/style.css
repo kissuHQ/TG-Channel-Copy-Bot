@@ -113,6 +113,13 @@ h1 { font-size: 20px; font-weight: 700; color: #fff; }
 }
 .input-row input:focus { border-color: var(--accent); }
 .channel-name { font-size: 13px; color: #888; margin-top: 6px; min-height: 18px; }
+.pair-input { margin-top:8px; }
+.wide-input, .pair-input input, select { width:100%; margin-top:8px; background:#111; border:1px solid var(--border); border-radius:8px; padding:8px 12px; color:var(--text); font-size:12px; }
+.check-grid, .type-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:10px; color:#aaa; font-size:11px; }
+.full-btn { width:100%; margin-top:12px; }
+.mini-danger, .mini-btn { padding:3px 7px; margin-top:7px; font-size:10px; }
+.mini-danger { background:#2d1212; color:var(--red); }
+.mini-btn { background:#0e1a2b; color:#60a5fa; }
 .toggle-row { display:flex; align-items:center; justify-content:space-between; gap:12px; }
 .hint { color:var(--muted); font-size:11px; line-height:1.5; margin-top:4px; }
 .auto-stats, .queue-note { color:#888; font-size:12px; margin-top:12px; }

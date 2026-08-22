@@ -14,6 +14,8 @@ import json
 import logging
 import time
 import io
+import hashlib
+import re
 import threading
 import tempfile
 import uuid
@@ -146,6 +148,28 @@ state = load_state()
 state.setdefault("auto_forward", False)
 state.setdefault("tasks", [])
 state.setdefault("auto_stats", {"sent": 0, "failed": 0})
+if not state.get("pairs"):
+    if state.get("source") and state.get("target"):
+        state["pairs"] = [{
+            "id": "default",
+            "name": "Default pair",
+            "source": state["source"],
+            "target": state["target"],
+            "source_title": state.get("source_title", str(state["source"])),
+            "target_title": state.get("target_title", str(state["target"])),
+            "allowed_types": ["text", "photo", "video", "doc", "other"],
+            "include_keywords": [],
+            "exclude_keywords": [],
+            "caption_prefix": "",
+            "caption_suffix": "",
+            "remove_links": False,
+            "remove_source_name": False,
+            "rate_delay": MSG_DELAY,
+        }]
+    else:
+        state["pairs"] = []
+state.setdefault("dedupe", {})
+state.setdefault("task_controls", {})
 
 # Sync requests are queued instead of being rejected while another sync runs.
 _task_queue = deque()
@@ -163,7 +187,67 @@ def _task_view(task):
         "created_at": task.get("created_at"),
         "min_id": task.get("min_id", 0),
         "limit": task.get("limit"),
+        "pair_id": task.get("pair_id"),
+        "stats": task.get("stats", {}),
+        "started_at": task.get("started_at"),
+        "finished_at": task.get("finished_at"),
+        "total": task.get("total", 0),
+        "current": task.get("current", 0),
     }
+
+
+def _pair_by_id(pair_id):
+    return next((p for p in state.get("pairs", []) if p.get("id") == pair_id), None)
+
+
+def _pair_config(pair):
+    pair = pair or {}
+    return {
+        "allowed_types": pair.get("allowed_types") or ["text", "photo", "video", "doc", "other"],
+        "include_keywords": [str(x).lower() for x in pair.get("include_keywords", []) if str(x).strip()],
+        "exclude_keywords": [str(x).lower() for x in pair.get("exclude_keywords", []) if str(x).strip()],
+        "caption_prefix": pair.get("caption_prefix", ""),
+        "caption_suffix": pair.get("caption_suffix", ""),
+        "remove_links": bool(pair.get("remove_links")),
+        "remove_source_name": bool(pair.get("remove_source_name")),
+        "rate_delay": max(0, min(float(pair.get("rate_delay", MSG_DELAY)), 300)),
+    }
+
+
+def _message_allowed(message, config):
+    msg_type = get_msg_type(message)
+    if msg_type not in config["allowed_types"]:
+        return False
+    text = (message.text or "").lower()
+    if config["include_keywords"] and not any(word in text for word in config["include_keywords"]):
+        return False
+    if any(word in text for word in config["exclude_keywords"]):
+        return False
+    return True
+
+
+def _edited_caption(message, config, source_title=""):
+    text = message.text or ""
+    if config["remove_links"]:
+        text = re.sub(r"(https?://|www\.)\S+", "", text, flags=re.IGNORECASE)
+    if config["remove_source_name"] and source_title:
+        text = re.sub(re.escape(source_title), "", text, flags=re.IGNORECASE)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    text = text.strip()
+    if text:
+        text = f"{config['caption_prefix']}{text}{config['caption_suffix']}"
+    else:
+        text = f"{config['caption_prefix']}{config['caption_suffix']}".strip()
+    return text
+
+
+def _dedupe_key(pair_id, message):
+    raw = f"{pair_id}:{message.id}:{message.text or ''}:{getattr(message, 'grouped_id', '')}"
+    media = getattr(message, "media", None)
+    doc = getattr(media, "document", None)
+    if doc:
+        raw += f":{getattr(doc, 'id', '')}:{getattr(doc, 'size', '')}"
+    return hashlib.sha256(raw.encode("utf-8", "ignore")).hexdigest()
 
 
 async def _task_worker():
@@ -190,7 +274,9 @@ async def _task_worker():
             try:
                 await _run_sync(
                     task["progress_msg"], task["source"], task["target"],
-                    task["reverse"], task["min_id"], task["limit"], task["is_bot"]
+                    task["reverse"], task["min_id"], task["limit"], task["is_bot"],
+                    task.get("pair_id"), task.get("config"), task["id"],
+                    task.get("source_title"), task.get("target_title")
                 )
                 task["status"] = "complete" if not state.get("running") else "complete"
             except Exception as exc:
@@ -198,6 +284,9 @@ async def _task_worker():
                 logger.exception("Queued task failed: %s", exc)
             finally:
                 task["finished_at"] = datetime.now().isoformat(timespec="seconds")
+                task["stats"] = dict(state.get("stats", {}))
+                task["total"] = state.get("total_msgs", 0)
+                task["current"] = state.get("current_id", 0)
                 task_view = _task_view(task)
                 state["tasks"] = [
                     task_view if item.get("id") == task["id"] else item
@@ -215,17 +304,21 @@ async def _task_worker():
 
 
 def _queue_sync(source, target, reverse=True, min_id=0, limit=None,
-                progress_msg=None, is_bot=False, mode="full"):
+                progress_msg=None, is_bot=False, mode="full", pair_id=None,
+                config=None):
+    pair = _pair_by_id(pair_id)
     task = {
         "id": uuid.uuid4().hex[:8],
         "source": source,
         "target": target,
-        "source_title": state.get("source_title", str(source)),
-        "target_title": state.get("target_title", str(target)),
+        "source_title": (pair or {}).get("source_title", state.get("source_title", str(source))),
+        "target_title": (pair or {}).get("target_title", state.get("target_title", str(target))),
         "reverse": reverse,
         "min_id": min_id,
         "limit": limit,
         "mode": mode,
+        "pair_id": pair_id or "default",
+        "config": config or _pair_config(_pair_by_id(pair_id)),
         "progress_msg": progress_msg or WebEvent(),
         "is_bot": is_bot,
         "status": "queued",
@@ -1011,7 +1104,9 @@ TYPE_ICON = {
 }
 
 
-async def _run_sync(progress_msg, source, target, reverse, min_id, limit, is_bot=False):
+async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
+                    is_bot=False, pair_id="default", config=None, task_id=None,
+                    source_title=None, target_title=None):
     async def edit_msg(text, parse_mode=None):
         try:
             if is_bot:
@@ -1022,8 +1117,9 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit, is_bot
         except Exception:
             pass
 
-    src_title  = state.get("source_title", str(source))
-    tgt_title  = state.get("target_title", str(target))
+    src_title  = source_title or state.get("source_title", str(source))
+    tgt_title  = target_title or state.get("target_title", str(target))
+    config = config or _pair_config(_pair_by_id(pair_id))
 
     try:
         source_entity = await client.get_entity(source)
@@ -1057,13 +1153,29 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit, is_bot
             min_id=min_id,
             limit=limit
         ):
-            if not state.get("running"):
+            controls = state.setdefault("task_controls", {})
+            control = controls.setdefault(task_id or "legacy", {"paused": False, "cancelled": False})
+            if control.get("cancelled") or not state.get("running"):
                 logger.info("Sync stopped by user command")
                 break
 
-            while state.get("paused"):
+            while control.get("paused") and not control.get("cancelled"):
                 await asyncio.sleep(2)
-                state.update(load_state())
+                control = state.get("task_controls", {}).get(task_id or "legacy", control)
+            if control.get("cancelled"):
+                break
+
+            if not _message_allowed(message, config):
+                stats = state.get("stats", stats)
+                stats["skipped"] = stats.get("skipped", 0) + 1
+                _log_live(f"⏭️ Filter skipped ID={message.id}")
+                continue
+            dedupe = state.setdefault("dedupe", {})
+            dkey = _dedupe_key(pair_id, message)
+            if dkey in dedupe:
+                stats["duplicates"] = stats.get("duplicates", 0) + 1
+                _log_live(f"⏭️ Duplicate skipped ID={message.id}")
+                continue
 
             # ── Progress callback (live log + bot preview) ────
             _prog_last_live  = [0.0]   # last _live_log update time
@@ -1178,7 +1290,8 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit, is_bot
                     try:
                         sent = await send_message(
                             target_entity, message,
-                            on_progress=on_progress if msg_type != "text" else None
+                            on_progress=on_progress if msg_type != "text" else None,
+                            config=config, source_title=src_title
                         )
                         break   # success
                     except (FilePartMissingError, TgTimeoutError, ServerError) as retry_err:
@@ -1192,6 +1305,11 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit, is_bot
                         await asyncio.sleep(wait)
 
                 if sent:
+                    dedupe[dkey] = datetime.now().isoformat(timespec="seconds")
+                    # Keep the latest IDs only; this prevents unbounded state growth.
+                    if len(dedupe) > 10000:
+                        for old_key in list(dedupe)[:2000]:
+                            dedupe.pop(old_key, None)
                     count += 1
                     stats[msg_type] = stats.get(msg_type, 0) + 1
                     state["last_synced_id"] = message.id
@@ -1238,9 +1356,9 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit, is_bot
 
                     if count % BATCH_SIZE == 0:
                         logger.info(f"Batch pause {BATCH_DELAY}s after {count} msgs")
-                        await asyncio.sleep(BATCH_DELAY)
+                        await asyncio.sleep(max(BATCH_DELAY, config["rate_delay"]))
                     else:
-                        await asyncio.sleep(MSG_DELAY)
+                        await asyncio.sleep(config["rate_delay"])
 
             except FloodWaitError as e:
                 wait = e.seconds + 10
@@ -1351,12 +1469,19 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit, is_bot
         await edit_msg(f"❌ Fatal error: {e}")
 
 
-async def send_message(target, message, on_progress=None):
+async def send_message(target, message, on_progress=None, config=None, source_title=""):
     # Telegram can often reuse the source media directly. This creates a new
     # message without a forward header and avoids download/upload round trips.
     # Restricted or otherwise non-copyable messages fall back to the existing
     # disk-based path below.
+    config = config or _pair_config(None)
+    needs_rewrite = any([
+        config["caption_prefix"], config["caption_suffix"],
+        config["remove_links"], config["remove_source_name"],
+    ])
     try:
+        if needs_rewrite:
+            raise ValueError("caption rewrite requires upload/copy path")
         await client.send_message(target, message, parse_mode="md", link_preview=False)
         logger.info(f"⚡ Copied directly msg_id={message.id} (no forward tag)")
         return True
@@ -1373,7 +1498,7 @@ async def send_message(target, message, on_progress=None):
         if not tmp_path or not Path(tmp_path).exists():
             raise Exception("Media download failed")
 
-        caption = message.text or ""
+        caption = _edited_caption(message, config, source_title)
         send_path = Path(tmp_path)
 
         # ── Type detect karo ──────────────────────────────
@@ -1457,7 +1582,7 @@ async def send_message(target, message, on_progress=None):
 
     elif message.text:
         await client.send_message(
-            target, message.text,
+            target, caption if "caption" in locals() else _edited_caption(message, config, source_title),
             parse_mode="md", link_preview=False
         )
         return True
@@ -1566,6 +1691,34 @@ async def _set_target(channel_input):
     return {"ok": True, "title": state["target_title"]}
 
 
+async def _create_pair(payload):
+    source = parse_channel_input(str(payload.get("source", "")))
+    target = parse_channel_input(str(payload.get("target", "")))
+    if not source or not target:
+        raise ValueError("Source and target are required")
+    src_entity, tgt_entity = await asyncio.gather(
+        client.get_entity(source), client.get_entity(target)
+    )
+    pair = {
+        "id": uuid.uuid4().hex[:8],
+        "name": str(payload.get("name") or "Pair"),
+        "source": source, "target": target,
+        "source_title": getattr(src_entity, "title", str(source)),
+        "target_title": getattr(tgt_entity, "title", str(target)),
+        "allowed_types": payload.get("allowed_types") or ["text", "photo", "video", "doc", "other"],
+        "include_keywords": [x.strip() for x in str(payload.get("include_keywords", "")).split(",") if x.strip()],
+        "exclude_keywords": [x.strip() for x in str(payload.get("exclude_keywords", "")).split(",") if x.strip()],
+        "caption_prefix": str(payload.get("caption_prefix", "")),
+        "caption_suffix": str(payload.get("caption_suffix", "")),
+        "remove_links": bool(payload.get("remove_links")),
+        "remove_source_name": bool(payload.get("remove_source_name")),
+        "rate_delay": max(0, min(float(payload.get("rate_delay", MSG_DELAY)), 300)),
+    }
+    state.setdefault("pairs", []).append(pair)
+    save_state(state)
+    return pair
+
+
 # ── Routes ─────────────────────────────────────────────
 
 @flask_app.route("/")
@@ -1595,6 +1748,7 @@ def _status_payload():
         "paused":  paused,
         "source":  state.get("source_title", ""),
         "target":  state.get("target_title", ""),
+        "pairs":   state.get("pairs", []),
         "last_id": state.get("last_synced_id", 0),
         "current": cur,
         "total":   tot,
@@ -1683,6 +1837,30 @@ def api_settarget():
         return jsonify({"ok": False, "error": str(e)})
 
 
+@flask_app.route("/api/pairs", methods=["GET"])
+def api_pairs():
+    return jsonify({"ok": True, "pairs": state.get("pairs", [])})
+
+
+@flask_app.route("/api/pairs", methods=["POST"])
+def api_add_pair():
+    try:
+        pair = _run_async(_create_pair(request.json or {}))
+        return jsonify({"ok": True, "pair": pair})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@flask_app.route("/api/pairs/<pair_id>", methods=["DELETE"])
+def api_delete_pair(pair_id):
+    before = len(state.get("pairs", []))
+    state["pairs"] = [p for p in state.get("pairs", []) if p.get("id") != pair_id]
+    if len(state["pairs"]) == before:
+        return jsonify({"ok": False, "error": "Pair not found"})
+    save_state(state)
+    return jsonify({"ok": True})
+
+
 @flask_app.route("/api/sync", methods=["POST"])
 def api_sync():
     if not state.get("source") or not state.get("target"):
@@ -1724,6 +1902,44 @@ def api_synclast():
 def api_tasks():
     return jsonify({"ok": True, "tasks": state.get("tasks", []),
                     "queue_size": len(_task_queue)})
+
+
+@flask_app.route("/api/tasks", methods=["POST"])
+def api_create_task():
+    payload = request.json or {}
+    pair = _pair_by_id(payload.get("pair_id"))
+    if not pair:
+        return jsonify({"ok": False, "error": "Select a valid source-target pair"})
+    mode = payload.get("mode", "full")
+    try:
+        limit = int(payload.get("limit", 0)) or None
+        min_id = int(payload.get("min_id", 0))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "Message limits must be numbers"})
+    task = _queue_sync(
+        pair["source"], pair["target"], mode != "last", min_id, limit,
+        WebEvent(), False, mode, pair["id"], _pair_config(pair)
+    )
+    return jsonify({"ok": True, "task": _task_view(task)})
+
+
+@flask_app.route("/api/tasks/<task_id>", methods=["PATCH", "DELETE"])
+def api_task_control(task_id):
+    task = next((t for t in state.get("tasks", []) if t.get("id") == task_id), None)
+    if not task:
+        return jsonify({"ok": False, "error": "Task not found"})
+    if request.method == "DELETE":
+        state.setdefault("task_controls", {})[task_id] = {"cancelled": True, "paused": False}
+        for queued in list(_task_queue):
+            if queued["id"] == task_id:
+                _task_queue.remove(queued)
+        task["status"] = "cancelled"
+    else:
+        paused = bool((request.json or {}).get("paused"))
+        state.setdefault("task_controls", {}).setdefault(task_id, {})["paused"] = paused
+        task["status"] = "paused" if paused else ("running" if task_id == state.get("active_task_id") else "queued")
+    save_state(state)
+    return jsonify({"ok": True, "task": task})
 
 
 @flask_app.route("/api/autoforward", methods=["POST"])

@@ -94,8 +94,25 @@ function renderStatus(data) {
   document.getElementById('auto-failed').textContent = autoStats.failed || 0;
   document.getElementById('queue-size').textContent = data.queue_size || 0;
   renderTasks(data.tasks || []);
+  if (data.pairs) renderPairs(data.pairs);
 
   document.getElementById('last-updated').textContent = new Date().toLocaleTimeString();
+}
+
+function renderPairs(pairs) {
+  const list = document.getElementById('pair-list');
+  const select = document.getElementById('task-pair');
+  if (!pairs || !pairs.length) {
+    list.innerHTML = '<div class="hint">Add a pair to create tracked tasks.</div>';
+    select.innerHTML = '<option value="">No pairs</option>';
+    return;
+  }
+  list.innerHTML = pairs.map(p => `<div class="task-item">
+    <strong>${escapeHtml(p.name)}</strong>
+    <div class="task-route">${escapeHtml(p.source_title)} → ${escapeHtml(p.target_title)}</div>
+    <button class="mini-danger" onclick="deletePair('${escapeHtml(p.id)}')">Delete</button>
+  </div>`).join('');
+  select.innerHTML = pairs.map(p => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name)}</option>`).join('');
 }
 
 function renderTasks(tasks) {
@@ -111,9 +128,19 @@ function renderTasks(tasks) {
     return `<div class="task-item">
       <div><strong>${escapeHtml(task.id)}</strong> <span class="task-status ${statusClass}">${escapeHtml(task.status)}</span></div>
       <div class="task-route">${escapeHtml(task.source || 'Source')} → ${escapeHtml(task.target || 'Target')}</div>
-      <div class="task-mode">${escapeHtml(task.mode || 'sync')}</div>
+      <div class="task-mode">${escapeHtml(task.mode || 'sync')} · direct ${task.stats?.direct || 0} · fallback ${task.stats?.fallback || 0}</div>
+      ${task.status === 'queued' || task.status === 'running' ? `<button class="mini-danger" onclick="controlTask('${escapeHtml(task.id)}','cancel')">Cancel</button>` : ''}
+      ${task.status === 'running' || task.status === 'paused' ? `<button class="mini-btn" onclick="controlTask('${escapeHtml(task.id)}','${task.status === 'paused' ? 'resume' : 'pause'}')">${task.status === 'paused' ? 'Resume' : 'Pause'}</button>` : ''}
     </div>`;
   }).join('');
+}
+
+async function controlTask(id, action) {
+  const url = '/api/tasks/' + encodeURIComponent(id);
+  const data = action === 'cancel'
+    ? await fetch(url, {method:'DELETE'}).then(r => r.json())
+    : await fetch(url, {method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({paused: action === 'pause'})}).then(r => r.json());
+  toast(data.ok ? '✅ Task updated' : '❌ ' + data.error, !data.ok);
 }
 
 function escapeHtml(value) {
@@ -161,9 +188,46 @@ async function loadDashboard() {
   try {
     const data = await api('/api/bootstrap');
     applyDashboard(data);
+    const pairs = await api('/api/pairs');
+    if (pairs.ok) renderPairs(pairs.pairs);
   } catch {
     toast('Dashboard connection failed', true);
   }
+}
+
+async function addPair() {
+  const payload = {
+    name: document.getElementById('pair-name').value.trim(),
+    source: document.getElementById('pair-source').value.trim(),
+    target: document.getElementById('pair-target').value.trim(),
+    include_keywords: document.getElementById('pair-include').value,
+    exclude_keywords: document.getElementById('pair-exclude').value,
+    caption_prefix: document.getElementById('pair-prefix').value,
+    caption_suffix: document.getElementById('pair-suffix').value,
+    remove_links: document.getElementById('pair-links').checked,
+    remove_source_name: document.getElementById('pair-source-name').checked,
+    allowed_types: [...document.querySelectorAll('.pair-type:checked')].map(x => x.value)
+  };
+  const data = await api('/api/pairs', payload);
+  if (!data.ok) return toast('❌ ' + data.error, true);
+  toast('✅ Pair added');
+  renderPairs((await api('/api/pairs')).pairs);
+}
+
+async function deletePair(id) {
+  if (!confirm('Delete this pair?')) return;
+  const data = await fetch('/api/pairs/' + encodeURIComponent(id), {method:'DELETE'}).then(r => r.json());
+  toast(data.ok ? '✅ Pair deleted' : '❌ ' + data.error, !data.ok);
+  if (data.ok) renderPairs((await api('/api/pairs')).pairs);
+}
+
+async function createTask() {
+  const pair_id = document.getElementById('task-pair').value;
+  const mode = document.getElementById('task-mode').value;
+  const value = parseInt(document.getElementById('task-limit').value || '0');
+  if (!pair_id) return toast('Pehle pair add karo', true);
+  const data = await api('/api/tasks', {pair_id, mode, limit: mode === 'last' ? value : 0, min_id: mode === 'from_id' ? value : 0});
+  toast(data.ok ? `✅ Task ${data.task.id} queued` : '❌ ' + data.error, !data.ok);
 }
 
 function connectDashboard() {
