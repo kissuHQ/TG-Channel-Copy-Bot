@@ -84,8 +84,42 @@ function renderStatus(data) {
   // Channels
   document.getElementById('src-name').textContent = data.source || 'Not set';
   document.getElementById('tgt-name').textContent = data.target || 'Not set';
+  const auto = !!data.auto_forward;
+  document.getElementById('auto-label').textContent = auto ? 'Enabled' : 'Disabled';
+  const autoBtn = document.getElementById('auto-toggle');
+  autoBtn.textContent = auto ? 'Disable' : 'Enable';
+  autoBtn.className = auto ? 'btn-primary' : 'btn-warn';
+  const autoStats = data.auto_stats || {};
+  document.getElementById('auto-sent').textContent = autoStats.sent || 0;
+  document.getElementById('auto-failed').textContent = autoStats.failed || 0;
+  document.getElementById('queue-size').textContent = data.queue_size || 0;
+  renderTasks(data.tasks || []);
 
   document.getElementById('last-updated').textContent = new Date().toLocaleTimeString();
+}
+
+function renderTasks(tasks) {
+  const box = document.getElementById('task-list');
+  if (!tasks.length) {
+    box.innerHTML = '<div class="hint">No tasks yet.</div>';
+    return;
+  }
+  box.innerHTML = tasks.slice(-12).reverse().map(task => {
+    const statusClass = task.status === 'complete' ? 'done' :
+                        task.status === 'failed' ? 'failed' :
+                        task.status === 'running' ? 'running' : 'queued';
+    return `<div class="task-item">
+      <div><strong>${escapeHtml(task.id)}</strong> <span class="task-status ${statusClass}">${escapeHtml(task.status)}</span></div>
+      <div class="task-route">${escapeHtml(task.source || 'Source')} → ${escapeHtml(task.target || 'Target')}</div>
+      <div class="task-mode">${escapeHtml(task.mode || 'sync')}</div>
+    </div>`;
+  }).join('');
+}
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, c => ({
+    '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#039;'
+  }[c]));
 }
 
 function _logClass(line) {
@@ -191,6 +225,14 @@ async function resetBot() {
   if (!confirm('Sab config reset ho jayega. Sure?')) return;
   const data = await api('/api/reset', {});
   toast(data.ok ? '✅ Reset done' : '❌ ' + data.error, !data.ok);
+}
+
+async function toggleAutoForward() {
+  const enabled = !document.getElementById('auto-label').textContent.includes('Enabled');
+  const data = await api('/api/autoforward', { enabled });
+  toast(data.ok
+    ? (enabled ? '✅ Auto-forward enabled' : '✅ Auto-forward disabled')
+    : '❌ ' + data.error, !data.ok);
 }
 
 // ── Init ───────────────────────────────────────────────

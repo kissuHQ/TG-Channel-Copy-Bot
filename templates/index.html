@@ -82,9 +82,22 @@
         <div class="channel-name" id="tgt-name">—</div>
       </div>
 
+      <div class="panel">
+        <div class="panel-title">🔁 Live Auto-Forward</div>
+        <div class="toggle-row">
+          <div>
+            <strong id="auto-label">Disabled</strong>
+            <div class="hint">New source posts copy instantly without a forward tag.</div>
+          </div>
+          <button id="auto-toggle" class="btn-warn" onclick="toggleAutoForward()">Enable</button>
+        </div>
+        <div class="auto-stats">Auto copied: <strong id="auto-sent">0</strong> · Failed: <strong id="auto-failed">0</strong></div>
+      </div>
+
       <!-- SYNC CONTROLS -->
       <div class="panel">
         <div class="panel-title">⚙️ Sync Controls</div>
+        <div class="queue-note">Multiple sync requests are supported and run one by one. Queue: <strong id="queue-size">0</strong></div>
 
         <div class="btn-group">
           <button class="btn-primary" onclick="syncAction('sync')">▶ Full Sync</button>
@@ -109,6 +122,11 @@
           <input id="synclast-input" type="number" placeholder="Number of messages"/>
           <button onclick="syncLast()">Go</button>
         </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">📋 Task Queue</div>
+        <div id="task-list" class="task-list"><div class="hint">No tasks yet.</div></div>
       </div>
 
     </div>

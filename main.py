@@ -16,6 +16,7 @@ import time
 import io
 import threading
 import tempfile
+import uuid
 from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -142,6 +143,104 @@ def save_state(state):
     _dashboard_changed()
 
 state = load_state()
+state.setdefault("auto_forward", False)
+state.setdefault("tasks", [])
+state.setdefault("auto_stats", {"sent": 0, "failed": 0})
+
+# Sync requests are queued instead of being rejected while another sync runs.
+_task_queue = deque()
+_task_worker_running = False
+_auto_forward_lock = asyncio.Lock()
+
+
+def _task_view(task):
+    return {
+        "id": task["id"],
+        "mode": task.get("mode", "full"),
+        "source": task.get("source_title", task.get("source")),
+        "target": task.get("target_title", task.get("target")),
+        "status": task.get("status", "queued"),
+        "created_at": task.get("created_at"),
+        "min_id": task.get("min_id", 0),
+        "limit": task.get("limit"),
+    }
+
+
+async def _task_worker():
+    global _task_worker_running
+    if _task_worker_running:
+        return
+    _task_worker_running = True
+    try:
+        while _task_queue:
+            task = _task_queue.popleft()
+            task["status"] = "running"
+            state["active_task_id"] = task["id"]
+            state["running"] = True
+            state["paused"] = False
+            state["stats"] = reset_stats()
+            state["current_id"] = 0
+            state["total_msgs"] = 0
+            state["tasks"] = [
+                {**item, "status": "running"} if item.get("id") == task["id"] else item
+                for item in state.get("tasks", [])
+            ]
+            save_state(state)
+            _log_live(f"📋 Task {task['id']} started ({task['mode']})")
+            try:
+                await _run_sync(
+                    task["progress_msg"], task["source"], task["target"],
+                    task["reverse"], task["min_id"], task["limit"], task["is_bot"]
+                )
+                task["status"] = "complete" if not state.get("running") else "complete"
+            except Exception as exc:
+                task["status"] = "failed"
+                logger.exception("Queued task failed: %s", exc)
+            finally:
+                task["finished_at"] = datetime.now().isoformat(timespec="seconds")
+                task_view = _task_view(task)
+                state["tasks"] = [
+                    task_view if item.get("id") == task["id"] else item
+                    for item in state.get("tasks", [])
+                ]
+                state.pop("active_task_id", None)
+                if _task_queue:
+                    state["running"] = True
+                save_state(state)
+    finally:
+        _task_worker_running = False
+        state["running"] = bool(_task_queue)
+        state.pop("active_task_id", None)
+        save_state(state)
+
+
+def _queue_sync(source, target, reverse=True, min_id=0, limit=None,
+                progress_msg=None, is_bot=False, mode="full"):
+    task = {
+        "id": uuid.uuid4().hex[:8],
+        "source": source,
+        "target": target,
+        "source_title": state.get("source_title", str(source)),
+        "target_title": state.get("target_title", str(target)),
+        "reverse": reverse,
+        "min_id": min_id,
+        "limit": limit,
+        "mode": mode,
+        "progress_msg": progress_msg or WebEvent(),
+        "is_bot": is_bot,
+        "status": "queued",
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    _task_queue.append(task)
+    state["tasks"] = state.get("tasks", []) + [_task_view(task)]
+    save_state(state)
+    # Web routes run in Flask's thread, while bot commands run on Telegram's
+    # event-loop thread. Always schedule the worker on the shared loop.
+    if _loop is not None and _loop.is_running():
+        asyncio.run_coroutine_threadsafe(_task_worker(), _loop)
+    else:
+        asyncio.create_task(_task_worker())
+    return task
 
 # ─── DISK-BASED DOWNLOADER (RAM bachane ke liye) ──────
 async def fast_download(media, progress_cb=None) -> str:
@@ -581,6 +680,8 @@ async def bot_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/sync — Full sync start karo\n"
         "/syncfrom `<id>` — Message ID se sync karo\n"
         "/synclast `<n>` — Last N messages sync karo\n"
+        "/tasks — Queue ke tasks dekho\n"
+        "/autoforward on|off — New posts automatically copy karo\n"
         "/pause — Sync pause karo\n"
         "/resume — Sync resume karo\n"
         "/stop — Sync stop karo\n"
@@ -809,6 +910,45 @@ async def bot_synclast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     asyncio.create_task(start_sync_bot(msg, reverse=False, limit=n))
 
 
+async def bot_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not bot_is_owner(update):
+        return
+    tasks = state.get("tasks", [])
+    if not tasks:
+        await update.message.reply_text("📋 Queue empty hai.")
+        return
+    active = state.get("active_task_id")
+    lines = ["📋 *Task Queue*"]
+    for task in tasks[-15:]:
+        marker = " 🔄" if task.get("id") == active else ""
+        lines.append(
+            f"`{task.get('id')}` — {task.get('mode', 'sync')} — "
+            f"{task.get('status', 'queued')}{marker}"
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def bot_autoforward(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not bot_is_owner(update):
+        return
+    if not context.args or context.args[0].lower() not in {"on", "off"}:
+        await update.message.reply_text(
+            f"Auto-forward ab {'ON' if state.get('auto_forward') else 'OFF'} hai.\n"
+            "Use: /autoforward on ya /autoforward off"
+        )
+        return
+    enabled = context.args[0].lower() == "on"
+    if enabled and (not state.get("source") or not state.get("target")):
+        await update.message.reply_text("❌ Pehle /setsource aur /settarget set karo.")
+        return
+    state["auto_forward"] = enabled
+    save_state(state)
+    await update.message.reply_text(
+        f"✅ Auto-forward {'ON' if enabled else 'OFF'} kar diya.\n"
+        "New posts direct copy honge; restricted post par download/upload fallback hoga."
+    )
+
+
 # ════════════════════════════════════════════════════════
 #  CORE SYNC ENGINE
 # ════════════════════════════════════════════════════════
@@ -817,52 +957,29 @@ async def start_sync_userbot(event, reverse=True, min_id=0, limit=None):
     if not state.get("source") or not state.get("target"):
         await event.edit("❌ Pehle `.setsource` aur `.settarget` karo!")
         return
-    if state.get("running"):
-        await event.edit("⚠️ Sync pehle se chal raha hai! `.stop` karo pehle.")
-        return
-
-    source = state["source"]
-    target = state["target"]
-    state["running"] = True
-    state["paused"] = False
-    state["stats"] = reset_stats()
-    state["current_id"] = 0
-    save_state(state)
-
-    progress_msg = await event.edit(
-        f"⏳ **Sync Starting...**\n\n"
-        f"📥 Source: `{state.get('source_title', source)}`\n"
-        f"📤 Target: `{state.get('target_title', target)}`\n"
-        f"⚙️ Fetching messages..."
+    source, target = state["source"], state["target"]
+    task = _queue_sync(source, target, reverse, min_id, limit, event,
+                       False, "full" if not limit and not min_id else "range")
+    await event.edit(
+        f"⏳ Task `{task['id']}` queued\n"
+        f"📥 {task['source_title']} → 📤 {task['target_title']}\n"
+        f"Queue mein {len(_task_queue)} task(s) hain."
     )
-
-    await _run_sync(progress_msg, source, target, reverse, min_id, limit, is_bot=False)
 
 
 async def start_sync_bot(progress_msg, reverse=True, min_id=0, limit=None):
     if not state.get("source") or not state.get("target"):
         await progress_msg.edit_text("❌ Pehle /setsource aur /settarget karo!")
         return
-    if state.get("running"):
-        await progress_msg.edit_text("⚠️ Sync pehle se chal raha hai! /stop karo pehle.")
-        return
-
-    source = state["source"]
-    target = state["target"]
-    state["running"] = True
-    state["paused"] = False
-    state["stats"] = reset_stats()
-    state["current_id"] = 0
-    save_state(state)
-
-    await progress_msg.edit_text(
-        f"⏳ Sync Starting...\n\n"
-        f"Source: {state.get('source_title', source)}\n"
-        f"Target: {state.get('target_title', target)}\n"
-        f"Fetching messages..."
+    task = _queue_sync(
+        state["source"], state["target"], reverse, min_id, limit,
+        progress_msg, True, "full" if not limit and not min_id else "range"
     )
-
-    await _run_sync(progress_msg, source, target, reverse, min_id, limit, is_bot=True)
+    await progress_msg.edit_text(
+        f"⏳ Task {task['id']} queued\n"
+        f"{task['source_title']} → {task['target_title']}\n"
+        f"Queue mein {len(_task_queue)} task(s) hain."
+    )
 
 
 def _make_progress_bar(done, total, width=14):
@@ -1347,6 +1464,48 @@ async def send_message(target, message, on_progress=None):
 
     return False
 
+
+def _telegram_chat_id(entity):
+    entity_id = getattr(entity, "id", entity if isinstance(entity, int) else None)
+    if entity_id is None:
+        return None
+    return int(f"-100{entity_id}") if entity_id > 0 else entity_id
+
+
+@client.on(events.NewMessage)
+async def auto_forward_handler(event):
+    """Mirror new source posts immediately, using the same copy/fallback path."""
+    if not state.get("auto_forward") or not state.get("source") or not state.get("target"):
+        return
+    try:
+        source_entity = await client.get_entity(state["source"])
+        if event.chat_id != _telegram_chat_id(source_entity):
+            return
+        # A single handler invocation per Telegram update, even after reconnects.
+        message = event.message
+        if not message:
+            return
+        async with _auto_forward_lock:
+            target = await client.get_entity(state["target"])
+            sent = await send_message(target, message)
+            auto_stats = state.setdefault("auto_stats", {"sent": 0, "failed": 0})
+            if sent:
+                auto_stats["sent"] += 1
+                _log_live(f"⚡ Auto-forwarded ID={message.id} (no forward tag)")
+            else:
+                auto_stats["failed"] += 1
+                _log_live(f"❌ Auto-forward failed ID={message.id}")
+            state["auto_stats"] = auto_stats
+            state["auto_last_id"] = message.id
+            save_state(state)
+    except Exception as exc:
+        logger.exception("Auto-forward failed: %s", exc)
+        auto_stats = state.setdefault("auto_stats", {"sent": 0, "failed": 0})
+        auto_stats["failed"] += 1
+        state["auto_stats"] = auto_stats
+        save_state(state)
+
+
 def get_msg_type(message) -> str:
     if not message.media or isinstance(message.media, MessageMediaWebPage):
         return "text"
@@ -1441,6 +1600,10 @@ def _status_payload():
         "total":   tot,
         "pct":     round(cur / tot * 100, 1) if tot else 0,
         "stats":   stats,
+        "auto_forward": bool(state.get("auto_forward")),
+        "auto_stats": state.get("auto_stats", {"sent": 0, "failed": 0}),
+        "tasks": state.get("tasks", []),
+        "queue_size": len(_task_queue),
         "transfer": state.get("transfer"),
         "uptime_seconds": elapsed,
         "uptime": f"{h}h {m}m {s}s" if h else f"{m}m {s}s",
@@ -1522,28 +1685,56 @@ def api_settarget():
 
 @flask_app.route("/api/sync", methods=["POST"])
 def api_sync():
-    if state.get("running"):
-        return jsonify({"ok": False, "error": "Already running"})
-    _run_bg(start_sync_userbot(WebEvent(), reverse=True, min_id=0))
-    return jsonify({"ok": True})
+    if not state.get("source") or not state.get("target"):
+        return jsonify({"ok": False, "error": "Set source and target first"})
+    task = _queue_sync(state["source"], state["target"], True, 0, None,
+                       WebEvent(), False, "full")
+    return jsonify({"ok": True, "task": _task_view(task)})
 
 
 @flask_app.route("/api/syncfrom", methods=["POST"])
 def api_syncfrom():
-    if state.get("running"):
-        return jsonify({"ok": False, "error": "Already running"})
-    mid = int((request.json or {}).get("min_id", 0))
-    _run_bg(start_sync_userbot(WebEvent(), reverse=True, min_id=mid))
-    return jsonify({"ok": True})
+    if not state.get("source") or not state.get("target"):
+        return jsonify({"ok": False, "error": "Set source and target first"})
+    try:
+        mid = int((request.json or {}).get("min_id", 0))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "Valid message ID required"})
+    task = _queue_sync(state["source"], state["target"], True, mid, None,
+                       WebEvent(), False, "from_id")
+    return jsonify({"ok": True, "task": _task_view(task)})
 
 
 @flask_app.route("/api/synclast", methods=["POST"])
 def api_synclast():
-    if state.get("running"):
-        return jsonify({"ok": False, "error": "Already running"})
-    n = int((request.json or {}).get("n", 10))
-    _run_bg(start_sync_userbot(WebEvent(), reverse=False, limit=n))
-    return jsonify({"ok": True})
+    if not state.get("source") or not state.get("target"):
+        return jsonify({"ok": False, "error": "Set source and target first"})
+    try:
+        n = int((request.json or {}).get("n", 10))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "Valid message count required"})
+    if n < 1:
+        return jsonify({"ok": False, "error": "Message count must be positive"})
+    task = _queue_sync(state["source"], state["target"], False, 0, n,
+                       WebEvent(), False, "last")
+    return jsonify({"ok": True, "task": _task_view(task)})
+
+
+@flask_app.route("/api/tasks", methods=["GET"])
+def api_tasks():
+    return jsonify({"ok": True, "tasks": state.get("tasks", []),
+                    "queue_size": len(_task_queue)})
+
+
+@flask_app.route("/api/autoforward", methods=["POST"])
+def api_autoforward():
+    enabled = bool((request.json or {}).get("enabled"))
+    if enabled and (not state.get("source") or not state.get("target")):
+        return jsonify({"ok": False, "error": "Set source and target first"})
+    state["auto_forward"] = enabled
+    save_state(state)
+    _log_live(f"🔁 Auto-forward {'enabled' if enabled else 'disabled'}")
+    return jsonify({"ok": True, "enabled": enabled})
 
 
 @flask_app.route("/api/pause", methods=["POST"])
@@ -1636,6 +1827,8 @@ async def main():
     app.add_handler(CommandHandler("sync", bot_sync))
     app.add_handler(CommandHandler("syncfrom", bot_syncfrom))
     app.add_handler(CommandHandler("synclast", bot_synclast))
+    app.add_handler(CommandHandler("tasks", bot_tasks))
+    app.add_handler(CommandHandler("autoforward", bot_autoforward))
 
     print("🤖 Telegram Bot started! Commands available via bot.")
     print("⚡ Both userbot + bot running...")
