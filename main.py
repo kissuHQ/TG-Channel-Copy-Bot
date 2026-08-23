@@ -16,6 +16,7 @@ import time
 import io
 import hashlib
 import re
+import csv
 import threading
 import tempfile
 import uuid
@@ -74,7 +75,10 @@ API_HASH     = _require_env("API_HASH")
 PHONE        = _require_env("PHONE")
 OWNER_ID     = int(_require_env("OWNER_ID"))
 BOT_TOKEN    = _require_env("BOT_TOKEN")
-SESSION_STRING = os.getenv("SESSION_STRING", "")  # env var se lega
+SESSION_STRING_FILE = "session_string.txt"
+SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
+if not SESSION_STRING and Path(SESSION_STRING_FILE).exists():
+    SESSION_STRING = Path(SESSION_STRING_FILE).read_text(encoding="utf-8").strip()
 
 
 MSG_DELAY    = 3        # seconds between messages
@@ -131,6 +135,19 @@ client = TelegramClient(
     connection_retries = 5,
     retry_delay        = 2,
 )
+
+
+def persist_session_string():
+    """Save the authorized Telethon session so future restarts do not ask OTP."""
+    try:
+        session_value = client.session.save()
+        if session_value:
+            path = Path(SESSION_STRING_FILE)
+            path.write_text(session_value + "\n", encoding="utf-8")
+            path.chmod(0o600)
+            logger.info("Telegram session persisted for next restart")
+    except Exception as exc:
+        logger.warning("Could not persist Telegram session: %s", exc)
 
 # ─── STATE MANAGEMENT ─────────────────────────────────
 def load_state():
@@ -248,6 +265,12 @@ def _dedupe_key(pair_id, message):
     if doc:
         raw += f":{getattr(doc, 'id', '')}:{getattr(doc, 'size', '')}"
     return hashlib.sha256(raw.encode("utf-8", "ignore")).hexdigest()
+
+
+def _remember_mapping(pair_id, source_id, sent):
+    target_id = getattr(sent, "id", None)
+    if target_id:
+        state.setdefault("message_map", {}).setdefault(str(pair_id), {})[str(source_id)] = target_id
 
 
 async def _task_worker():
@@ -1305,6 +1328,7 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
                         await asyncio.sleep(wait)
 
                 if sent:
+                    _remember_mapping(pair_id, message.id, sent)
                     dedupe[dkey] = datetime.now().isoformat(timespec="seconds")
                     # Keep the latest IDs only; this prevents unbounded state growth.
                     if len(dedupe) > 10000:
@@ -1482,9 +1506,9 @@ async def send_message(target, message, on_progress=None, config=None, source_ti
     try:
         if needs_rewrite:
             raise ValueError("caption rewrite requires upload/copy path")
-        await client.send_message(target, message, parse_mode="md", link_preview=False)
+        sent = await client.send_message(target, message, parse_mode="md", link_preview=False)
         logger.info(f"⚡ Copied directly msg_id={message.id} (no forward tag)")
-        return True
+        return sent or True
     except Exception as copy_error:
         logger.debug(f"Direct copy unavailable for msg_id={message.id}: {copy_error}")
 
@@ -1534,7 +1558,7 @@ async def send_message(target, message, on_progress=None, config=None, source_ti
         try:
             if is_photo:
                 # Photo as photo
-                await client.send_file(
+                sent = await client.send_file(
                     target, str(send_path),
                     caption=caption, parse_mode="md",
                     force_document=False,
@@ -1543,7 +1567,7 @@ async def send_message(target, message, on_progress=None, config=None, source_ti
                 )
             elif is_video:
                 # Video as streamable video (not document)
-                await client.send_file(
+                sent = await client.send_file(
                     target, str(send_path),
                     caption=caption, parse_mode="md",
                     force_document=False,   # streamable video
@@ -1554,7 +1578,7 @@ async def send_message(target, message, on_progress=None, config=None, source_ti
                 )
             elif is_audio:
                 # Audio as audio player
-                await client.send_file(
+                sent = await client.send_file(
                     target, str(send_path),
                     caption=caption, parse_mode="md",
                     force_document=False,
@@ -1564,7 +1588,7 @@ async def send_message(target, message, on_progress=None, config=None, source_ti
                 )
             else:
                 # PDF, CSV, ZIP, etc — document as document
-                await client.send_file(
+                sent = await client.send_file(
                     target, str(send_path),
                     caption=caption, parse_mode="md",
                     force_document=True,
@@ -1578,14 +1602,14 @@ async def send_message(target, message, on_progress=None, config=None, source_ti
             except Exception:
                 pass
 
-        return True
+        return sent or True
 
     elif message.text:
-        await client.send_message(
+        sent = await client.send_message(
             target, caption if "caption" in locals() else _edited_caption(message, config, source_title),
             parse_mode="md", link_preview=False
         )
-        return True
+        return sent or True
 
     return False
 
@@ -1631,6 +1655,21 @@ async def auto_forward_handler(event):
         save_state(state)
 
 
+@client.on(events.MessageEdited)
+async def edit_sync_handler(event):
+    if not state.get("source") or event.chat_id != _telegram_chat_id(await client.get_entity(state["source"])):
+        return
+    message = event.message
+    mapping = state.get("message_map", {}).get("default", {}).get(str(message.id))
+    if not mapping or not state.get("target"):
+        return
+    try:
+        await client.edit_message(state["target"], mapping, text=message.text or "")
+        _log_live(f"✏️ Edited target message for source ID={message.id}")
+    except Exception as exc:
+        logger.warning("Edit sync failed for %s: %s", message.id, exc)
+
+
 def get_msg_type(message) -> str:
     if not message.media or isinstance(message.media, MessageMediaWebPage):
         return "text"
@@ -1652,6 +1691,42 @@ def get_msg_type(message) -> str:
 flask_app  = Flask(__name__)
 _start_time = time.time()
 _loop: asyncio.AbstractEventLoop = None   # set in main()
+_bot_application = None
+_health_snapshot = {}
+
+
+async def _notify_owner(text):
+    if _bot_application:
+        try:
+            await _bot_application.bot.send_message(chat_id=OWNER_ID, text=text)
+        except Exception as exc:
+            logger.warning("Owner alert failed: %s", exc)
+
+
+async def health_monitor():
+    while True:
+        await asyncio.sleep(300)
+        snapshot = {}
+        for label, channel in (("source", state.get("source")), ("target", state.get("target"))):
+            if not channel:
+                snapshot[label] = "not configured"
+                continue
+            try:
+                await client.get_entity(channel)
+                snapshot[label] = "ok"
+            except Exception as exc:
+                snapshot[label] = type(exc).__name__
+        connected = client.is_connected()
+        snapshot["login"] = "ok" if connected else "offline"
+        if snapshot != _health_snapshot:
+            old = dict(_health_snapshot)
+            _health_snapshot.update(snapshot)
+            state["health"] = snapshot
+            save_state(state)
+            if old and snapshot != old:
+                await _notify_owner("⚠️ Channel health changed:\n" + "\n".join(
+                    f"{key}: {value}" for key, value in snapshot.items()
+                ))
 
 
 # ── Async helpers ──────────────────────────────────────
@@ -1758,6 +1833,7 @@ def _status_payload():
         "auto_stats": state.get("auto_stats", {"sent": 0, "failed": 0}),
         "tasks": state.get("tasks", []),
         "queue_size": len(_task_queue),
+        "health": state.get("health", {}),
         "transfer": state.get("transfer"),
         "uptime_seconds": elapsed,
         "uptime": f"{h}h {m}m {s}s" if h else f"{m}m {s}s",
@@ -1987,6 +2063,30 @@ def api_logs():
     return jsonify({"logs": list(_live_log)})
 
 
+@flask_app.route("/api/logs/search")
+def api_logs_search():
+    query = request.args.get("q", "").lower().strip()
+    logs = list(_live_log)
+    if query:
+        logs = [line for line in logs if query in line.lower()]
+    return jsonify({"logs": logs})
+
+
+@flask_app.route("/api/tasks/<task_id>/report")
+def api_task_report(task_id):
+    task = next((t for t in state.get("tasks", []) if t.get("id") == task_id), None)
+    if not task:
+        return jsonify({"ok": False, "error": "Task not found"}), 404
+    if request.args.get("format") == "csv":
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["id", "pair_id", "status", "current", "total", "created_at", "finished_at"])
+        writer.writerow([task.get(k, "") for k in ("id", "pair_id", "status", "current", "total", "created_at", "finished_at")])
+        return Response(output.getvalue(), mimetype="text/csv",
+                        headers={"Content-Disposition": f"attachment; filename=task-{task_id}.csv"})
+    return jsonify({"ok": True, "task": task})
+
+
 @flask_app.route("/health")
 def health():
     return jsonify({"status": "ok", "running": state.get("running", False)})
@@ -2011,6 +2111,7 @@ async def main():
 
     # Start Telethon userbot
     await client.start(phone=PHONE)
+    persist_session_string()
     me = await client.get_me()
     print(f"✅ Userbot logged in as: {me.first_name} (@{me.username})")
     print(f"🔐 Owner ID: {OWNER_ID}")
