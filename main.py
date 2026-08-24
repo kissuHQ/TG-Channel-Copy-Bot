@@ -22,6 +22,7 @@ import tempfile
 import uuid
 import random
 import shutil
+import mimetypes
 from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -97,6 +98,7 @@ DEFAULT_DAILY_MEDIA_MB = 2048
 # storage ceiling, not a promise that the host has this much free space.
 TEMP_STORAGE_LIMIT_BYTES = 1_800 * 1024 * 1024
 TEMP_DIR = Path("/tmp/archive_bot")
+THUMBNAIL_DIR = Path("thumbnails")
 
 LOG_FILE     = "sync.log"
 
@@ -265,6 +267,12 @@ def _pair_config(pair):
         "quiet_start": str(pair.get("quiet_start", "")),
         "quiet_end": str(pair.get("quiet_end", "")),
         "protected_behavior": pair.get("protected_behavior", "download"),
+        "caption_enabled": bool(pair.get("caption_enabled", False)),
+        "caption_template": str(pair.get("caption_template", "")),
+        "caption_types": pair.get("caption_types") or ["text", "photo", "video", "doc", "other"],
+        "caption_parse_mode": str(pair.get("caption_parse_mode", "md")),
+        "thumbnail_enabled": bool(pair.get("thumbnail_enabled", False)),
+        "thumbnail_path": str(pair.get("thumbnail_path", "")),
     }
 
 
@@ -407,6 +415,7 @@ async def send_album(target, messages, on_progress=None, config=None,
     needs_rewrite = any([
         config["caption_prefix"], config["caption_suffix"],
         config["remove_links"], config["remove_source_name"],
+        config.get("caption_enabled"), config.get("thumbnail_enabled"),
     ])
     restricted = bool(
         getattr(source_entity, "noforwards", False)
@@ -416,7 +425,7 @@ async def send_album(target, messages, on_progress=None, config=None,
         return await client.send_file(
             target, [message.media for message in messages],
             caption=[message.text or "" for message in messages],
-            parse_mode="md"
+            parse_mode=_parse_mode(config)
         )
 
     paths = []
@@ -429,7 +438,8 @@ async def send_album(target, messages, on_progress=None, config=None,
             raise RuntimeError("Album media download failed")
         captions = [_edited_caption(message, config, source_title) for message in messages]
         return await client.send_file(
-            target, paths, caption=captions, parse_mode="md"
+            target, paths, caption=captions, parse_mode=_parse_mode(config),
+            thumb=_thumbnail_path(config)
         )
     finally:
         for path in paths:
@@ -440,18 +450,61 @@ async def send_album(target, messages, on_progress=None, config=None,
 
 
 def _edited_caption(message, config, source_title=""):
+    msg_type = get_msg_type(message)
     text = message.text or ""
     if config["remove_links"]:
         text = re.sub(r"(https?://|www\.)\S+", "", text, flags=re.IGNORECASE)
     if config["remove_source_name"] and source_title:
         text = re.sub(re.escape(source_title), "", text, flags=re.IGNORECASE)
-    text = re.sub(r"[ \t]{2,}", " ", text)
-    text = text.strip()
+    text = re.sub(r"[ \t]{2,}", " ", text).strip()
+    if config.get("caption_enabled") and msg_type in config.get("caption_types", []):
+        document = getattr(getattr(message, "media", None), "document", None)
+        filename = ""
+        if document:
+            filename = next((a.file_name for a in (document.attributes or [])
+                             if isinstance(a, DocumentAttributeFilename)), "")
+        size = getattr(document, "size", 0) or 0
+        values = {
+            "caption": text, "filename": filename, "filesize": _human_size(size),
+            "filesize_mb": f"{size / 1048576:.2f}", "message_id": str(getattr(message, "id", "")),
+            "source": source_title, "date": datetime.now().strftime("%Y-%m-%d"),
+            "time": datetime.now().strftime("%H:%M"), "mime": getattr(document, "mime_type", "") if document else "",
+            "type": msg_type,
+        }
+        template = config.get("caption_template", "")
+        if template:
+            try:
+                text = template.format_map(_SafeFormat(values))
+            except (ValueError, KeyError):
+                logger.warning("Invalid caption template; using original caption")
     if text:
         text = f"{config['caption_prefix']}{text}{config['caption_suffix']}"
     else:
         text = f"{config['caption_prefix']}{config['caption_suffix']}".strip()
     return text
+
+
+def _human_size(size):
+    size = float(size or 0)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.1f} {unit}"
+        size /= 1024
+
+
+class _SafeFormat(dict):
+    def __missing__(self, key):
+        return "{" + key + "}"
+
+
+def _thumbnail_path(config):
+    path = config.get("thumbnail_path", "")
+    return path if config.get("thumbnail_enabled") and path and Path(path).is_file() else None
+
+
+def _parse_mode(config):
+    mode = str(config.get("caption_parse_mode", "md")).lower()
+    return {"md": "md", "markdown": "md", "html": "html"}.get(mode)
 
 
 def _dedupe_key(pair_id, message):
@@ -1042,6 +1095,8 @@ async def bot_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/synclast `<n>` — Last N messages sync karo\n"
         "/tasks — Queue ke tasks dekho\n"
         "/autoforward on|off — New posts automatically copy karo\n"
+        "/caption <pair_id> on|off [template] — Caption rules set karo\n"
+        "/setthumbnail <pair_id> — Is command ke reply mein video thumbnail photo bhejo\n"
         "/pause — Sync pause karo\n"
         "/resume — Sync resume karo\n"
         "/stop — Sync stop karo\n"
@@ -1050,6 +1105,68 @@ async def bot_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⚠️ Sirf owner use kar sakta hai",
         parse_mode="Markdown"
     )
+
+
+async def bot_caption(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not bot_is_owner(update):
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Usage: /caption <pair_id> on|off [template]\n"
+            "Placeholders: {caption} {filename} {filesize} {filesize_mb} "
+            "{message_id} {source} {date} {time} {mime} {type}"
+        )
+        return
+    pair = _pair_by_id(context.args[0])
+    if not pair:
+        await update.message.reply_text("❌ Pair ID nahi mila. /status ya dashboard se ID dekho.")
+        return
+    enabled = context.args[1].lower() in {"on", "enable", "enabled"}
+    template_args = context.args[2:]
+    if template_args and template_args[0].lower().startswith("types="):
+        pair["caption_types"] = [
+            value.strip() for value in template_args[0][6:].split(",")
+            if value.strip() in {"text", "photo", "video", "doc", "other"}
+        ]
+        template_args = template_args[1:]
+    pair["caption_enabled"] = enabled
+    if template_args:
+        pair["caption_template"] = " ".join(template_args)
+    save_state(state)
+    await update.message.reply_text(
+        f"✅ Caption {'enabled' if enabled else 'disabled'} for {pair.get('name', pair['id'])}"
+    )
+
+
+async def bot_setthumbnail(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not bot_is_owner(update):
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: kisi photo ko reply karke /setthumbnail <pair_id> bhejo"
+        )
+        return
+    pair = _pair_by_id(context.args[0])
+    if pair and len(context.args) > 1 and context.args[1].lower() in {"off", "disable"}:
+        pair["thumbnail_enabled"] = False
+        save_state(state)
+        await update.message.reply_text(f"✅ Thumbnail disabled for {pair.get('name', pair['id'])}")
+        return
+    if not update.message.reply_to_message:
+        await update.message.reply_text("❌ Thumbnail set karne ke liye photo ko reply karo.")
+        return
+    replied = update.message.reply_to_message
+    if not pair or not getattr(replied, "photo", None):
+        await update.message.reply_text("❌ Valid pair ID aur replied photo required hai.")
+        return
+    THUMBNAIL_DIR.mkdir(parents=True, exist_ok=True)
+    path = THUMBNAIL_DIR / f"{pair['id']}.jpg"
+    tg_file = await context.bot.get_file(replied.photo[-1].file_id)
+    await tg_file.download_to_drive(custom_path=str(path))
+    pair["thumbnail_path"] = str(path)
+    pair["thumbnail_enabled"] = True
+    save_state(state)
+    await update.message.reply_text(f"✅ Thumbnail enabled for {pair.get('name', pair['id'])}")
 
 async def bot_setsource(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not bot_is_owner(update):
@@ -1822,6 +1939,7 @@ async def send_message(target, message, on_progress=None, config=None, source_ti
     needs_rewrite = any([
         config["caption_prefix"], config["caption_suffix"],
         config["remove_links"], config["remove_source_name"],
+        config.get("caption_enabled"), config.get("thumbnail_enabled"),
     ])
     # Telegram marks protected channels with noforwards. Do not probe a
     # protected message with a copy request: download and re-upload instead.
@@ -1840,7 +1958,7 @@ async def send_message(target, message, on_progress=None, config=None, source_ti
             raise ValueError("source channel has forwarding protection")
         if needs_rewrite:
             raise ValueError("caption rewrite requires upload/copy path")
-        sent = await client.send_message(target, message, parse_mode="md", link_preview=False)
+        sent = await client.send_message(target, message, parse_mode=_parse_mode(config), link_preview=False)
         logger.info(f"⚡ Copied directly msg_id={message.id} (no forward tag)")
         return sent or True
     except Exception as copy_error:
@@ -1879,7 +1997,7 @@ async def send_message(target, message, on_progress=None, config=None, source_ti
 
         # Rename to original filename if available
         if original_filename:
-            named_path = Path("/tmp") / original_filename
+            named_path = Path(tmp_path).with_name(f"{Path(tmp_path).stem}_{Path(original_filename).name}")
             send_path.rename(named_path)
             send_path = named_path
 
@@ -1894,7 +2012,7 @@ async def send_message(target, message, on_progress=None, config=None, source_ti
                 # Photo as photo
                 sent = await client.send_file(
                     target, str(send_path),
-                    caption=caption, parse_mode="md",
+                    caption=caption, parse_mode=_parse_mode(config),
                     force_document=False,
                     part_size_kb=1024,
                     progress_callback=ul_cb,
@@ -1903,9 +2021,10 @@ async def send_message(target, message, on_progress=None, config=None, source_ti
                 # Video as streamable video (not document)
                 sent = await client.send_file(
                     target, str(send_path),
-                    caption=caption, parse_mode="md",
+                    caption=caption, parse_mode=_parse_mode(config),
                     force_document=False,   # streamable video
                     supports_streaming=True,
+                    thumb=_thumbnail_path(config),
                     attributes=attributes,  # original duration/dimensions preserve
                     part_size_kb=1024,
                     progress_callback=ul_cb,
@@ -1914,7 +2033,7 @@ async def send_message(target, message, on_progress=None, config=None, source_ti
                 # Audio as audio player
                 sent = await client.send_file(
                     target, str(send_path),
-                    caption=caption, parse_mode="md",
+                    caption=caption, parse_mode=_parse_mode(config),
                     force_document=False,
                     attributes=attributes,  # title/duration preserve
                     part_size_kb=1024,
@@ -1924,7 +2043,7 @@ async def send_message(target, message, on_progress=None, config=None, source_ti
                 # PDF, CSV, ZIP, etc — document as document
                 sent = await client.send_file(
                     target, str(send_path),
-                    caption=caption, parse_mode="md",
+                    caption=caption, parse_mode=_parse_mode(config),
                     force_document=True,
                     attributes=attributes,
                     part_size_kb=1024,
@@ -2193,6 +2312,12 @@ async def _create_pair(payload):
         "quiet_start": str(payload.get("quiet_start", "")),
         "quiet_end": str(payload.get("quiet_end", "")),
         "protected_behavior": str(payload.get("protected_behavior", "download")),
+        "caption_enabled": bool(payload.get("caption_enabled", False)),
+        "caption_template": str(payload.get("caption_template", "")),
+        "caption_types": payload.get("caption_types") or ["text", "photo", "video", "doc", "other"],
+        "caption_parse_mode": str(payload.get("caption_parse_mode", "md")),
+        "thumbnail_enabled": bool(payload.get("thumbnail_enabled", False)),
+        "thumbnail_path": "",
     }
     state.setdefault("pairs", []).append(pair)
     save_state(state)
@@ -2388,7 +2513,8 @@ def api_delete_pair(pair_id):
                     "remove_source_name", "include_keywords", "exclude_keywords",
                     "allowed_types", "dedupe_mode", "max_posts_per_hour",
                     "schedule_start", "schedule_end", "quiet_start", "quiet_end",
-                    "protected_behavior"):
+                    "protected_behavior", "caption_enabled", "caption_template",
+                    "caption_types", "caption_parse_mode", "thumbnail_enabled"):
             if key in payload:
                 pair[key] = payload[key]
         save_state(state)
@@ -2399,6 +2525,41 @@ def api_delete_pair(pair_id):
         return jsonify({"ok": False, "error": "Pair not found"})
     save_state(state)
     return jsonify({"ok": True})
+
+
+@flask_app.route("/api/pairs/<pair_id>/thumbnail", methods=["POST", "DELETE"])
+def api_pair_thumbnail(pair_id):
+    pair = _pair_by_id(pair_id)
+    if not pair:
+        return jsonify({"ok": False, "error": "Pair not found"}), 404
+    THUMBNAIL_DIR.mkdir(parents=True, exist_ok=True)
+    old = pair.get("thumbnail_path")
+    if request.method == "DELETE":
+        if old:
+            Path(old).unlink(missing_ok=True)
+        pair["thumbnail_path"] = ""
+        pair["thumbnail_enabled"] = False
+        save_state(state)
+        return jsonify({"ok": True, "enabled": False})
+    upload = request.files.get("thumbnail")
+    if not upload or not upload.filename:
+        return jsonify({"ok": False, "error": "Upload a thumbnail image"}), 400
+    if not (upload.mimetype or "").startswith("image/"):
+        return jsonify({"ok": False, "error": "Thumbnail must be an image"}), 400
+    upload.stream.seek(0, os.SEEK_END)
+    size = upload.stream.tell()
+    upload.stream.seek(0)
+    if size > 20 * 1024 * 1024:
+        return jsonify({"ok": False, "error": "Thumbnail must be 20 MB or smaller"}), 400
+    suffix = Path(upload.filename).suffix.lower() or ".jpg"
+    path = THUMBNAIL_DIR / f"{pair_id}{suffix}"
+    upload.save(path)
+    if old and old != str(path):
+        Path(old).unlink(missing_ok=True)
+    pair["thumbnail_path"] = str(path)
+    pair["thumbnail_enabled"] = True
+    save_state(state)
+    return jsonify({"ok": True, "enabled": True, "filename": path.name})
 
 
 @flask_app.route("/api/pairs/<pair_id>/dedupe", methods=["POST"])
@@ -2770,6 +2931,8 @@ async def main():
     app.add_handler(CommandHandler("synclast", bot_synclast))
     app.add_handler(CommandHandler("tasks", bot_tasks))
     app.add_handler(CommandHandler("autoforward", bot_autoforward))
+    app.add_handler(CommandHandler("caption", bot_caption))
+    app.add_handler(CommandHandler("setthumbnail", bot_setthumbnail))
 
     print("🤖 Telegram Bot started! Commands available via bot.")
     print("⚡ Both userbot + bot running...")

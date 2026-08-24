@@ -116,7 +116,7 @@ function renderPairs(pairs) {
   list.innerHTML = pairs.map(p => `<div class="task-item">
     <strong>${escapeHtml(p.name)}</strong>
     <div class="task-route">${escapeHtml(p.source_title)} → ${escapeHtml(p.target_title)}</div>
-    <div class="task-mode">${p.auto_forward ? '⚡ auto-forward on' : 'auto-forward off'} · ${p.rate_delay || 3}s delay · max ${p.max_messages || 5000}/run</div>
+     <div class="task-mode">${p.auto_forward ? '⚡ auto-forward on' : 'auto-forward off'} · ${p.rate_delay || 3}s delay · max ${p.max_messages || 5000}/run · ${p.caption_enabled ? 'caption on' : 'caption off'} · ${p.thumbnail_enabled ? 'thumbnail on' : 'thumbnail off'}</div>
      <button class="mini-btn" onclick="editPair('${escapeHtml(p.id)}')">Edit settings</button>
      <button class="mini-btn" onclick="copyAgain('${escapeHtml(p.id)}')">Copy again</button>
     <button class="mini-danger" onclick="deletePair('${escapeHtml(p.id)}')">Delete</button>
@@ -249,6 +249,11 @@ async function addPair() {
     ,quiet_end: document.getElementById('pair-quiet-end').value
     ,max_posts_per_hour: parseInt(document.getElementById('pair-hourly').value || '0')
     ,protected_behavior: document.getElementById('pair-protected').value
+    ,caption_enabled: document.getElementById('pair-caption-enabled').checked
+    ,caption_template: document.getElementById('pair-caption-template').value
+    ,caption_parse_mode: document.getElementById('pair-caption-mode').value
+    ,caption_types: [...document.querySelectorAll('.caption-type:checked')].map(x => x.value)
+    ,thumbnail_enabled: document.getElementById('pair-thumbnail-enabled').checked
   };
   const editingId = window._editingPairId;
   const data = editingId
@@ -285,6 +290,11 @@ function editPair(id) {
   document.getElementById('pair-quiet-end').value = pair.quiet_end || '';
   document.getElementById('pair-hourly').value = pair.max_posts_per_hour || 0;
   document.getElementById('pair-protected').value = pair.protected_behavior || 'download';
+  document.getElementById('pair-caption-enabled').checked = !!pair.caption_enabled;
+  document.getElementById('pair-caption-template').value = pair.caption_template || '';
+  document.getElementById('pair-caption-mode').value = pair.caption_parse_mode || 'md';
+  document.querySelectorAll('.caption-type').forEach(input => input.checked = (pair.caption_types || []).includes(input.value));
+  document.getElementById('pair-thumbnail-enabled').checked = !!pair.thumbnail_enabled;
   document.querySelectorAll('.pair-type').forEach(input => input.checked = (pair.allowed_types || []).includes(input.value));
   toast('Settings edit mode: Save with Add pair button');
 }
@@ -298,6 +308,19 @@ async function cleanupStorage() {
   if (!confirm('Temporary downloaded files delete karne hain?')) return;
   const data = await api('/api/storage/cleanup', {});
   toast(data.ok ? `✅ ${data.removed} temporary files cleaned` : '❌ ' + data.error, !data.ok);
+}
+
+async function uploadThumbnail() {
+  const pairId = window._editingPairId;
+  const file = document.getElementById('pair-thumbnail-file').files[0];
+  if (!pairId) return toast('Pehle existing pair ko Edit karo, phir thumbnail upload karo', true);
+  if (!file) return toast('Thumbnail image select karo', true);
+  const form = new FormData();
+  form.append('thumbnail', file);
+  const response = await fetch('/api/pairs/' + encodeURIComponent(pairId) + '/thumbnail', {method:'POST', body:form});
+  const data = await response.json();
+  toast(data.ok ? '✅ Thumbnail uploaded' : '❌ ' + data.error, !data.ok);
+  if (data.ok) document.getElementById('pair-thumbnail-enabled').checked = true;
 }
 
 async function deletePair(id) {

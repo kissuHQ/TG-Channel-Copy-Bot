@@ -104,6 +104,15 @@
         <input id="pair-exclude" class="wide-input" placeholder="Exclude keywords: spam, ad"/>
         <input id="pair-prefix" class="wide-input" placeholder="Caption prefix"/>
         <input id="pair-suffix" class="wide-input" placeholder="Caption suffix"/>
+        <textarea id="pair-caption-template" class="wide-input" rows="3"
+          placeholder="Caption template (e.g. 🎬 {filename}&#10;Size: {filesize}&#10;{caption}"></textarea>
+        <div class="hint">Placeholders: {caption} {filename} {filesize} {filesize_mb} {message_id} {source} {date} {time} {mime} {type}</div>
+        <div class="input-row pair-input">
+          <select id="pair-caption-mode" title="Caption formatting">
+            <option value="md">Markdown</option><option value="html">HTML</option><option value="none">Plain text</option>
+          </select>
+          <label class="inline-check"><input id="pair-caption-enabled" type="checkbox"/> Enable caption changer</label>
+        </div>
         <div class="input-row pair-input">
           <select id="pair-profile" aria-label="Rate limit profile"><option value="balanced">Balanced · 3s</option><option value="very_safe">Very Safe · 5s</option><option value="slow">Slow · 10s</option></select>
           <input id="pair-rate" type="number" min="3" max="300" step="1" value="3" placeholder="Rate delay (seconds)"/>
@@ -123,6 +132,15 @@
           <label><input class="pair-type" type="checkbox" value="photo" checked/> Photos</label>
           <label><input class="pair-type" type="checkbox" value="video" checked/> Videos</label>
           <label><input class="pair-type" type="checkbox" value="doc" checked/> Documents</label>
+          <label><input class="caption-type" type="checkbox" value="text" checked/> Caption text</label>
+          <label><input class="caption-type" type="checkbox" value="photo" checked/> Caption photos</label>
+          <label><input class="caption-type" type="checkbox" value="video" checked/> Caption videos</label>
+          <label><input class="caption-type" type="checkbox" value="doc" checked/> Caption docs</label>
+        </div>
+        <div class="input-row pair-input">
+          <label class="inline-check"><input id="pair-thumbnail-enabled" type="checkbox"/> Enable video thumbnail</label>
+          <input id="pair-thumbnail-file" type="file" accept="image/*" title="Upload video thumbnail"/>
+          <button type="button" class="mini-btn" onclick="uploadThumbnail()">Upload thumbnail</button>
         </div>
         <div class="input-row pair-input">
           <input id="pair-schedule-start" type="time" title="Schedule start"/>

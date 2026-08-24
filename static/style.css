@@ -115,6 +115,10 @@ h1 { font-size: 20px; font-weight: 700; color: #fff; }
 .channel-name { font-size: 13px; color: #888; margin-top: 6px; min-height: 18px; }
 .pair-input { margin-top:8px; }
 .wide-input, .pair-input input, select { width:100%; margin-top:8px; background:#111; border:1px solid var(--border); border-radius:8px; padding:8px 12px; color:var(--text); font-size:12px; }
+textarea.wide-input { resize: vertical; min-height: 70px; font-family: inherit; line-height: 1.4; }
+.inline-check { display:flex; align-items:center; gap:6px; color:#aaa; font-size:11px; white-space:nowrap; }
+.inline-check input { accent-color:var(--accent); }
+input[type=file] { overflow:hidden; }
 select[multiple] { min-height: 92px; }
 .check-grid, .type-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:10px; color:#aaa; font-size:11px; }
 .full-btn { width:100%; margin-top:12px; }
