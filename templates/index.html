@@ -104,8 +104,13 @@
         <input id="pair-prefix" class="wide-input" placeholder="Caption prefix"/>
         <input id="pair-suffix" class="wide-input" placeholder="Caption suffix"/>
         <div class="input-row pair-input">
+          <select id="pair-profile" aria-label="Rate limit profile"><option value="balanced">Balanced · 3s</option><option value="very_safe">Very Safe · 5s</option><option value="slow">Slow · 10s</option></select>
           <input id="pair-rate" type="number" min="3" max="300" step="1" value="3" placeholder="Rate delay (seconds)"/>
           <input id="pair-max" type="number" min="1" max="5000" step="1" value="5000" placeholder="Max messages/run"/>
+        </div>
+        <div class="input-row pair-input">
+          <input id="pair-daily-msg" type="number" min="1" max="5000" value="1000" placeholder="Daily message limit"/>
+          <input id="pair-daily-mb" type="number" min="1" max="102400" value="2048" placeholder="Daily media limit (MB)"/>
         </div>
         <div class="check-grid">
           <label><input id="pair-links" type="checkbox"/> Remove links</label>
@@ -161,7 +166,9 @@
           <input id="task-limit" type="number" placeholder="N / message ID (optional)"/>
            <select id="task-priority" aria-label="Task priority"><option value="normal">Normal priority</option><option value="high">High priority</option><option value="low">Low priority</option></select>
            <button class="btn-primary" onclick="createTask()">Add selected tasks</button>
+           <button class="btn-warn" onclick="dryRunTasks()">Dry run</button>
         </div>
+         <div id="dry-run-result" class="hint"></div>
          <div class="btn-group task-bulk-controls">
            <button class="mini-btn" onclick="bulkTasks('pause')">Pause selected</button>
            <button class="mini-btn" onclick="bulkTasks('resume')">Resume selected</button>

@@ -102,6 +102,7 @@ function renderStatus(data) {
 function renderPairs(pairs) {
   const list = document.getElementById('pair-list');
   const select = document.getElementById('task-pair');
+  window._dashboardPairs = pairs || [];
   if (!pairs || !pairs.length) {
     list.innerHTML = '<div class="hint">Add a pair to create tracked tasks.</div>';
     select.innerHTML = '<option value="">No pairs</option>';
@@ -111,6 +112,7 @@ function renderPairs(pairs) {
     <strong>${escapeHtml(p.name)}</strong>
     <div class="task-route">${escapeHtml(p.source_title)} → ${escapeHtml(p.target_title)}</div>
     <div class="task-mode">${p.auto_forward ? '⚡ auto-forward on' : 'auto-forward off'} · ${p.rate_delay || 3}s delay · max ${p.max_messages || 5000}/run</div>
+    <button class="mini-btn" onclick="editPair('${escapeHtml(p.id)}')">Edit settings</button>
     <button class="mini-danger" onclick="deletePair('${escapeHtml(p.id)}')">Delete</button>
   </div>`).join('');
     select.innerHTML = pairs.map(p => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name)} — ${escapeHtml(p.source_title)} → ${escapeHtml(p.target_title)}</option>`).join('');
@@ -211,15 +213,45 @@ async function addPair() {
     caption_suffix: document.getElementById('pair-suffix').value,
     remove_links: document.getElementById('pair-links').checked,
     remove_source_name: document.getElementById('pair-source-name').checked,
+    rate_profile: document.getElementById('pair-profile').value,
     rate_delay: parseInt(document.getElementById('pair-rate').value || '3'),
     max_messages: parseInt(document.getElementById('pair-max').value || '5000'),
+    daily_message_limit: parseInt(document.getElementById('pair-daily-msg').value || '1000'),
+    daily_media_mb: parseInt(document.getElementById('pair-daily-mb').value || '2048'),
     auto_forward: document.getElementById('pair-auto').checked,
     allowed_types: [...document.querySelectorAll('.pair-type:checked')].map(x => x.value)
   };
-  const data = await api('/api/pairs', payload);
+  const editingId = window._editingPairId;
+  const data = editingId
+    ? await fetch('/api/pairs/' + encodeURIComponent(editingId), {method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)}).then(r => r.json())
+    : await api('/api/pairs', payload);
   if (!data.ok) return toast('❌ ' + data.error, true);
-  toast('✅ Pair added');
+  window._editingPairId = null;
+  toast(editingId ? '✅ Pair settings saved' : '✅ Pair added');
   renderPairs((await api('/api/pairs')).pairs);
+}
+
+function editPair(id) {
+  const pair = (window._dashboardPairs || []).find(item => item.id === id);
+  if (!pair) return;
+  window._editingPairId = id;
+  document.getElementById('pair-name').value = pair.name || '';
+  document.getElementById('pair-source').value = pair.source || '';
+  document.getElementById('pair-target').value = pair.target || '';
+  document.getElementById('pair-include').value = (pair.include_keywords || []).join(', ');
+  document.getElementById('pair-exclude').value = (pair.exclude_keywords || []).join(', ');
+  document.getElementById('pair-prefix').value = pair.caption_prefix || '';
+  document.getElementById('pair-suffix').value = pair.caption_suffix || '';
+  document.getElementById('pair-profile').value = pair.rate_profile || 'balanced';
+  document.getElementById('pair-rate').value = pair.rate_delay || 3;
+  document.getElementById('pair-max').value = pair.max_messages || 5000;
+  document.getElementById('pair-daily-msg').value = pair.daily_message_limit || 1000;
+  document.getElementById('pair-daily-mb').value = pair.daily_media_mb || 2048;
+  document.getElementById('pair-auto').checked = !!pair.auto_forward;
+  document.getElementById('pair-links').checked = !!pair.remove_links;
+  document.getElementById('pair-source-name').checked = !!pair.remove_source_name;
+  document.querySelectorAll('.pair-type').forEach(input => input.checked = (pair.allowed_types || []).includes(input.value));
+  toast('Settings edit mode: Save with Add pair button');
 }
 
 async function deletePair(id) {
@@ -242,6 +274,21 @@ async function createTask() {
     data = await api('/api/tasks', {...payload, allow_duplicate: true});
   }
   toast(data.ok ? `✅ ${data.created_count} task(s) queue mein add` : '❌ ' + data.error, !data.ok);
+}
+
+async function dryRunTasks() {
+  const pair_ids = [...document.getElementById('task-pair').selectedOptions].map(option => option.value);
+  const mode = document.getElementById('task-mode').value;
+  const value = parseInt(document.getElementById('task-limit').value || '0');
+  if (!pair_ids.length) return toast('Pehle pairs select karo', true);
+  const data = await api('/api/tasks/dry-run', {pair_ids, mode, value});
+  if (!data.ok) return toast('❌ ' + data.error, true);
+  const reports = data.reports.map(report =>
+    `<div><strong>${escapeHtml(report.pair)}</strong>: total ${report.total_messages}, allowed ${report.allowed_messages}, filtered ${report.filtered_messages}, duplicates ${report.duplicate_messages}, media ${report.estimated_media_mb} MB, approx ${Math.ceil(report.approximate_seconds / 60)} min</div>`
+  ).join('');
+  document.getElementById('dry-run-result').innerHTML =
+    '<strong>Dry-run report</strong>' + reports +
+    '<br><button class="mini-btn" onclick="createTask()">Confirm & queue these tasks</button>';
 }
 
 async function bulkTasks(action) {

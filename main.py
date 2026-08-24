@@ -20,6 +20,7 @@ import csv
 import threading
 import tempfile
 import uuid
+import random
 from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -88,6 +89,9 @@ MIN_RATE_DELAY = 3
 MAX_BATCH_TASKS = 5
 MAX_TASK_MESSAGES = 5000
 TASK_PRIORITIES = {"low": 10, "normal": 20, "high": 30}
+RATE_PROFILES = {"very_safe": 5, "balanced": 3, "slow": 10}
+DEFAULT_DAILY_MESSAGES = 1000
+DEFAULT_DAILY_MEDIA_MB = 2048
 
 LOG_FILE     = "sync.log"
 
@@ -224,6 +228,8 @@ def _pair_by_id(pair_id):
 
 def _pair_config(pair):
     pair = pair or {}
+    profile = str(pair.get("rate_profile", "balanced")).lower()
+    profile_delay = RATE_PROFILES.get(profile, RATE_PROFILES["balanced"])
     return {
         "allowed_types": pair.get("allowed_types") or ["text", "photo", "video", "doc", "other"],
         "include_keywords": [str(x).lower() for x in pair.get("include_keywords", []) if str(x).strip()],
@@ -232,8 +238,11 @@ def _pair_config(pair):
         "caption_suffix": pair.get("caption_suffix", ""),
         "remove_links": bool(pair.get("remove_links")),
         "remove_source_name": bool(pair.get("remove_source_name")),
-        "rate_delay": max(MIN_RATE_DELAY, min(float(pair.get("rate_delay", MSG_DELAY)), 300)),
+        "rate_profile": profile if profile in RATE_PROFILES else "balanced",
+        "rate_delay": max(MIN_RATE_DELAY, min(float(pair.get("rate_delay", profile_delay)), 300)),
         "max_messages": max(1, min(int(pair.get("max_messages", MAX_TASK_MESSAGES)), MAX_TASK_MESSAGES)),
+        "daily_message_limit": max(1, min(int(pair.get("daily_message_limit", DEFAULT_DAILY_MESSAGES)), MAX_TASK_MESSAGES)),
+        "daily_media_mb": max(1, min(int(pair.get("daily_media_mb", DEFAULT_DAILY_MEDIA_MB)), 102400)),
         "auto_forward": bool(pair.get("auto_forward", False)),
     }
 
@@ -248,6 +257,69 @@ def _message_allowed(message, config):
     if any(word in text for word in config["exclude_keywords"]):
         return False
     return True
+
+
+def _media_size_mb(message):
+    media = getattr(message, "media", None)
+    document = getattr(media, "document", None)
+    return (getattr(document, "size", 0) or 0) / (1024 * 1024)
+
+
+def _daily_budget(pair_id, config, message, commit=False):
+    today = datetime.now().date().isoformat()
+    usage = state.setdefault("daily_usage", {})
+    bucket = usage.setdefault(str(pair_id or "default"), {"date": today, "messages": 0, "media_mb": 0.0})
+    if bucket.get("date") != today:
+        bucket.update({"date": today, "messages": 0, "media_mb": 0.0})
+    size_mb = _media_size_mb(message)
+    allowed = (
+        bucket["messages"] < config.get("daily_message_limit", DEFAULT_DAILY_MESSAGES)
+        and bucket["media_mb"] + size_mb <= config.get("daily_media_mb", DEFAULT_DAILY_MEDIA_MB)
+    )
+    if allowed and commit:
+        bucket["messages"] += 1
+        bucket["media_mb"] = round(bucket["media_mb"] + size_mb, 2)
+    return allowed, bucket
+
+
+async def send_album(target, messages, on_progress=None, config=None,
+                     source_title="", source_entity=None):
+    """Copy a Telegram album as one grouped post when possible."""
+    config = config or _pair_config(None)
+    source_entity = source_entity or getattr(messages[0], "chat", None)
+    needs_rewrite = any([
+        config["caption_prefix"], config["caption_suffix"],
+        config["remove_links"], config["remove_source_name"],
+    ])
+    restricted = bool(
+        getattr(source_entity, "noforwards", False)
+        or any(getattr(message, "noforwards", False) for message in messages)
+    )
+    if not restricted and not needs_rewrite:
+        return await client.send_file(
+            target, [message.media for message in messages],
+            caption=[message.text or "" for message in messages],
+            parse_mode="md"
+        )
+
+    paths = []
+    try:
+        for message in messages:
+            path = await fast_download(message.media)
+            if path and Path(path).exists():
+                paths.append(path)
+        if len(paths) != len(messages):
+            raise RuntimeError("Album media download failed")
+        captions = [_edited_caption(message, config, source_title) for message in messages]
+        return await client.send_file(
+            target, paths, caption=captions, parse_mode="md"
+        )
+    finally:
+        for path in paths:
+            try:
+                Path(path).unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 def _edited_caption(message, config, source_title=""):
@@ -1191,6 +1263,7 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
         failed  = 0
         stats   = reset_stats()
         _last_edit = 0   # throttle edit calls (max 1 per sec)
+        handled_albums = set()
 
         async for message in client.iter_messages(
             source_entity,
@@ -1210,6 +1283,45 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
             if control.get("cancelled"):
                 break
 
+            grouped_id = getattr(message, "grouped_id", None)
+            if grouped_id and grouped_id not in handled_albums:
+                nearby = await client.get_messages(
+                    source_entity, limit=20, offset_id=message.id + 10
+                )
+                album = sorted(
+                    [item for item in nearby if getattr(item, "grouped_id", None) == grouped_id],
+                    key=lambda item: item.id
+                )
+                if len(album) > 1:
+                    first_id = album[0].id if reverse else album[-1].id
+                    if message.id != first_id:
+                        continue
+                    handled_albums.add(grouped_id)
+                    album = [item for item in album if _message_allowed(item, config)]
+                    album = [
+                        item for item in album
+                        if _dedupe_key(pair_id, item) not in state.setdefault("dedupe", {})
+                    ]
+                    if album and all(_daily_budget(pair_id, config, item)[0] for item in album):
+                        sent_album = await send_album(
+                            target_entity, album, config=config,
+                            source_title=src_title, source_entity=source_entity
+                        )
+                        sent_album = sent_album if isinstance(sent_album, list) else [sent_album]
+                        for index, item in enumerate(album):
+                            sent_item = sent_album[min(index, len(sent_album) - 1)] if sent_album else None
+                            _remember_mapping(pair_id, item.id, sent_item)
+                            state.setdefault("dedupe", {})[_dedupe_key(pair_id, item)] = datetime.now().isoformat(timespec="seconds")
+                            stats[get_msg_type(item)] = stats.get(get_msg_type(item), 0) + 1
+                            _daily_budget(pair_id, config, item, commit=True)
+                        count += len(album)
+                        state["current_id"] = count
+                        state["stats"] = stats
+                        save_state(state)
+                        _log_live(f"🖼️ Album copied as grouped media ({len(album)} items)")
+                        await asyncio.sleep(max(MIN_RATE_DELAY, config["rate_delay"] + random.uniform(-0.5, 0.5)))
+                        continue
+
             if not _message_allowed(message, config):
                 stats = state.get("stats", stats)
                 stats["skipped"] = stats.get("skipped", 0) + 1
@@ -1221,6 +1333,13 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
                 stats["duplicates"] = stats.get("duplicates", 0) + 1
                 _log_live(f"⏭️ Duplicate skipped ID={message.id}")
                 continue
+            budget_ok, budget_bucket = _daily_budget(pair_id, config, message)
+            if not budget_ok:
+                _log_live(
+                    f"🛑 Daily limit reached for pair {pair_id}: "
+                    f"{budget_bucket['messages']} messages / {budget_bucket['media_mb']:.1f} MB"
+                )
+                break
 
             # ── Progress callback (live log + bot preview) ────
             _prog_last_live  = [0.0]   # last _live_log update time
@@ -1359,6 +1478,7 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
                             dedupe.pop(old_key, None)
                     count += 1
                     stats[msg_type] = stats.get(msg_type, 0) + 1
+                    _daily_budget(pair_id, config, message, commit=True)
                     state["last_synced_id"] = message.id
                     state["current_id"]     = count
                     state["stats"]          = stats
@@ -1405,7 +1525,10 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
                         logger.info(f"Batch pause {BATCH_DELAY}s after {count} msgs")
                         await asyncio.sleep(max(BATCH_DELAY, config["rate_delay"]))
                     else:
-                        await asyncio.sleep(config["rate_delay"])
+                        await asyncio.sleep(max(
+                            MIN_RATE_DELAY,
+                            config["rate_delay"] + random.uniform(-0.5, 0.5)
+                        ))
 
             except FloodWaitError as e:
                 wait = e.seconds + 10
@@ -1697,6 +1820,10 @@ async def auto_forward_handler(event):
                 if not _message_allowed(message, pair_config):
                     _log_live(f"⏭️ Auto-forward filter skipped ID={message.id}")
                     continue
+                budget_ok, budget_bucket = _daily_budget(route_key[0], pair_config, message)
+                if not budget_ok:
+                    _log_live(f"🛑 Auto-forward daily limit reached for {pair.get('target')}")
+                    continue
                 target = await client.get_entity(pair["target"])
                 sent = await send_message(
                     target, message,
@@ -1707,13 +1834,17 @@ async def auto_forward_handler(event):
                 auto_stats = state.setdefault("auto_stats", {"sent": 0, "failed": 0})
                 if sent:
                     sent_count += 1
+                    _daily_budget(route_key[0], pair_config, message, commit=True)
                     auto_stats["sent"] += 1
                     _log_live(f"⚡ Auto-forwarded ID={message.id} → {pair.get('target_title', pair['target'])}")
                 else:
                     auto_stats["failed"] += 1
                     _log_live(f"❌ Auto-forward failed ID={message.id}")
                 state["auto_stats"] = auto_stats
-                await asyncio.sleep(pair_config["rate_delay"])
+                await asyncio.sleep(max(
+                    MIN_RATE_DELAY,
+                    pair_config["rate_delay"] + random.uniform(-0.5, 0.5)
+                ))
             state["auto_last_id"] = message.id
             save_state(state)
     except Exception as exc:
@@ -1856,13 +1987,50 @@ async def _create_pair(payload):
         "caption_suffix": str(payload.get("caption_suffix", "")),
         "remove_links": bool(payload.get("remove_links")),
         "remove_source_name": bool(payload.get("remove_source_name")),
+        "rate_profile": str(payload.get("rate_profile", "balanced")).lower(),
         "rate_delay": max(MIN_RATE_DELAY, min(float(payload.get("rate_delay", MSG_DELAY)), 300)),
         "max_messages": max(1, min(int(payload.get("max_messages", MAX_TASK_MESSAGES)), MAX_TASK_MESSAGES)),
+        "daily_message_limit": max(1, min(int(payload.get("daily_message_limit", DEFAULT_DAILY_MESSAGES)), MAX_TASK_MESSAGES)),
+        "daily_media_mb": max(1, min(int(payload.get("daily_media_mb", DEFAULT_DAILY_MEDIA_MB)), 102400)),
         "auto_forward": bool(payload.get("auto_forward", False)),
     }
     state.setdefault("pairs", []).append(pair)
     save_state(state)
     return pair
+
+
+async def _dry_run_pair(pair, mode="full", limit=None, min_id=0):
+    config = _pair_config(pair)
+    source_entity = await client.get_entity(pair["source"])
+    scan_limit = min(limit or config["max_messages"], config["max_messages"])
+    messages = []
+    async for message in client.iter_messages(
+        source_entity, reverse=mode != "last", min_id=min_id, limit=scan_limit
+    ):
+        messages.append(message)
+    allowed = [message for message in messages if _message_allowed(message, config)]
+    duplicates = [message for message in allowed if _dedupe_key(pair["id"], message) in state.get("dedupe", {})]
+    media_mb = sum(_media_size_mb(message) for message in allowed)
+    return {
+        "pair": pair.get("name", pair["id"]),
+        "total_messages": len(messages),
+        "allowed_messages": len(allowed) - len(duplicates),
+        "filtered_messages": len(messages) - len(allowed),
+        "duplicate_messages": len(duplicates),
+        "estimated_media_mb": round(media_mb, 2),
+        "approximate_seconds": round(len(allowed) * config["rate_delay"] + (len(allowed) // BATCH_SIZE) * BATCH_DELAY),
+    }
+
+
+async def _dry_run_many(pairs, mode, value):
+    return await asyncio.gather(*[
+        _dry_run_pair(
+            pair, mode,
+            value if mode == "last" else None,
+            value if mode == "from_id" else 0
+        )
+        for pair in pairs
+    ])
 
 
 # ── Routes ─────────────────────────────────────────────
@@ -2003,8 +2171,22 @@ def api_add_pair():
         return jsonify({"ok": False, "error": str(e)})
 
 
-@flask_app.route("/api/pairs/<pair_id>", methods=["DELETE"])
+@flask_app.route("/api/pairs/<pair_id>", methods=["PATCH", "DELETE"])
 def api_delete_pair(pair_id):
+    if request.method == "PATCH":
+        pair = _pair_by_id(pair_id)
+        if not pair:
+            return jsonify({"ok": False, "error": "Pair not found"})
+        payload = request.json or {}
+        for key in ("rate_profile", "rate_delay", "max_messages",
+                    "daily_message_limit", "daily_media_mb", "auto_forward",
+                    "caption_prefix", "caption_suffix", "remove_links",
+                    "remove_source_name", "include_keywords", "exclude_keywords",
+                    "allowed_types"):
+            if key in payload:
+                pair[key] = payload[key]
+        save_state(state)
+        return jsonify({"ok": True, "pair": pair})
     before = len(state.get("pairs", []))
     state["pairs"] = [p for p in state.get("pairs", []) if p.get("id") != pair_id]
     if len(state["pairs"]) == before:
@@ -2054,6 +2236,29 @@ def api_synclast():
 def api_tasks():
     return jsonify({"ok": True, "tasks": state.get("tasks", []),
                     "queue_size": len(_task_queue)})
+
+
+@flask_app.route("/api/tasks/dry-run", methods=["POST"])
+def api_tasks_dry_run():
+    payload = request.json or {}
+    pair_ids = payload.get("pair_ids") or ([payload.get("pair_id")] if payload.get("pair_id") else [])
+    pairs = [_pair_by_id(str(pair_id)) for pair_id in pair_ids]
+    if not pairs or any(pair is None for pair in pairs):
+        return jsonify({"ok": False, "error": "Select valid pairs first"})
+    mode = payload.get("mode", "full")
+    try:
+        value = int(payload.get("value", 0))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "Dry-run value must be a number"})
+    if mode == "last" and value < 1:
+        return jsonify({"ok": False, "error": "Enter a positive Last N value"})
+    if mode == "from_id" and value < 1:
+        return jsonify({"ok": False, "error": "Enter a positive message ID"})
+    try:
+        reports = _run_async(_dry_run_many(pairs, mode, value), timeout=120)
+        return jsonify({"ok": True, "reports": reports})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)})
 
 
 @flask_app.route("/api/tasks", methods=["POST"])
