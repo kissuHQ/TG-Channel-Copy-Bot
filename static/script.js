@@ -95,6 +95,11 @@ function renderStatus(data) {
   document.getElementById('queue-size').textContent = data.queue_size || 0;
   renderTasks(data.tasks || []);
   if (data.pairs) renderPairs(data.pairs);
+  renderHealth(data.pair_health || {});
+  const storage = data.storage || {};
+  document.getElementById('storage-status').innerHTML =
+    `<strong>${storage.used_mb || 0} / ${storage.limit_mb || 1800} MB used</strong> · ` +
+    `${storage.available_mb || 0} MB available`;
 
   document.getElementById('last-updated').textContent = new Date().toLocaleTimeString();
 }
@@ -112,11 +117,29 @@ function renderPairs(pairs) {
     <strong>${escapeHtml(p.name)}</strong>
     <div class="task-route">${escapeHtml(p.source_title)} → ${escapeHtml(p.target_title)}</div>
     <div class="task-mode">${p.auto_forward ? '⚡ auto-forward on' : 'auto-forward off'} · ${p.rate_delay || 3}s delay · max ${p.max_messages || 5000}/run</div>
-    <button class="mini-btn" onclick="editPair('${escapeHtml(p.id)}')">Edit settings</button>
+     <button class="mini-btn" onclick="editPair('${escapeHtml(p.id)}')">Edit settings</button>
+     <button class="mini-btn" onclick="copyAgain('${escapeHtml(p.id)}')">Copy again</button>
     <button class="mini-danger" onclick="deletePair('${escapeHtml(p.id)}')">Delete</button>
   </div>`).join('');
     select.innerHTML = pairs.map(p => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name)} — ${escapeHtml(p.source_title)} → ${escapeHtml(p.target_title)}</option>`).join('');
     [...select.options].forEach((option, index) => option.selected = index === 0);
+}
+
+function renderHealth(health) {
+  const box = document.getElementById('health-list');
+  const pairs = window._dashboardPairs || [];
+  if (!pairs.length) { box.innerHTML = '<div class="hint">No pairs configured.</div>'; return; }
+  box.innerHTML = pairs.map(pair => {
+    const h = health[pair.id] || {};
+    const ok = h.source_accessible && h.target_writable;
+    return `<div class="task-item">
+      <strong>${escapeHtml(pair.name)}</strong>
+      <span class="task-status ${ok ? 'done' : 'failed'}">${ok ? 'healthy' : 'attention'}</span>
+      <div class="task-mode">Source: ${h.source_accessible ? '✓ accessible' : '✕ unavailable'} · Target: ${h.target_writable ? '✓ writable' : '✕ no write permission'}</div>
+      <div class="task-mode">Protection: ${h.protected ? 'enabled' : 'off'} · Last sync: ${escapeHtml(h.last_success || '—')}</div>
+      ${h.last_error ? `<div class="task-mode" style="color:#f87171">${escapeHtml(h.last_error)}</div>` : ''}
+    </div>`;
+  }).join('');
 }
 
 function renderTasks(tasks) {
@@ -220,6 +243,12 @@ async function addPair() {
     daily_media_mb: parseInt(document.getElementById('pair-daily-mb').value || '2048'),
     auto_forward: document.getElementById('pair-auto').checked,
     allowed_types: [...document.querySelectorAll('.pair-type:checked')].map(x => x.value)
+    ,schedule_start: document.getElementById('pair-schedule-start').value
+    ,schedule_end: document.getElementById('pair-schedule-end').value
+    ,quiet_start: document.getElementById('pair-quiet-start').value
+    ,quiet_end: document.getElementById('pair-quiet-end').value
+    ,max_posts_per_hour: parseInt(document.getElementById('pair-hourly').value || '0')
+    ,protected_behavior: document.getElementById('pair-protected').value
   };
   const editingId = window._editingPairId;
   const data = editingId
@@ -250,8 +279,25 @@ function editPair(id) {
   document.getElementById('pair-auto').checked = !!pair.auto_forward;
   document.getElementById('pair-links').checked = !!pair.remove_links;
   document.getElementById('pair-source-name').checked = !!pair.remove_source_name;
+  document.getElementById('pair-schedule-start').value = pair.schedule_start || '';
+  document.getElementById('pair-schedule-end').value = pair.schedule_end || '';
+  document.getElementById('pair-quiet-start').value = pair.quiet_start || '';
+  document.getElementById('pair-quiet-end').value = pair.quiet_end || '';
+  document.getElementById('pair-hourly').value = pair.max_posts_per_hour || 0;
+  document.getElementById('pair-protected').value = pair.protected_behavior || 'download';
   document.querySelectorAll('.pair-type').forEach(input => input.checked = (pair.allowed_types || []).includes(input.value));
   toast('Settings edit mode: Save with Add pair button');
+}
+
+async function copyAgain(id) {
+  const data = await api('/api/pairs/' + encodeURIComponent(id) + '/dedupe', {});
+  toast(data.ok ? `✅ ${data.removed} duplicate identities cleared` : '❌ ' + data.error, !data.ok);
+}
+
+async function cleanupStorage() {
+  if (!confirm('Temporary downloaded files delete karne hain?')) return;
+  const data = await api('/api/storage/cleanup', {});
+  toast(data.ok ? `✅ ${data.removed} temporary files cleaned` : '❌ ' + data.error, !data.ok);
 }
 
 async function deletePair(id) {

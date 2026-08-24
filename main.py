@@ -21,6 +21,7 @@ import threading
 import tempfile
 import uuid
 import random
+import shutil
 from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -92,6 +93,10 @@ TASK_PRIORITIES = {"low": 10, "normal": 20, "high": 30}
 RATE_PROFILES = {"very_safe": 5, "balanced": 3, "slow": 10}
 DEFAULT_DAILY_MESSAGES = 1000
 DEFAULT_DAILY_MEDIA_MB = 2048
+# Keep a safety margin on the small Replit disk.  This is a hard temporary
+# storage ceiling, not a promise that the host has this much free space.
+TEMP_STORAGE_LIMIT_BYTES = 1_800 * 1024 * 1024
+TEMP_DIR = Path("/tmp/archive_bot")
 
 LOG_FILE     = "sync.log"
 
@@ -195,6 +200,15 @@ if not state.get("pairs"):
         state["pairs"] = []
 state.setdefault("dedupe", {})
 state.setdefault("task_controls", {})
+state.setdefault("message_map", {})
+state.setdefault("media_fingerprints", {})
+state.setdefault("pair_health", {})
+state.setdefault("oversized_messages", [])
+state.setdefault("templates", {})
+state.setdefault("notification_settings", {
+    "task_complete": True, "task_failed": True, "flood_wait": True,
+    "disconnect": True, "daily_summary": False,
+})
 
 # Sync requests are queued instead of being rejected while another sync runs.
 _task_queue = deque()
@@ -244,7 +258,110 @@ def _pair_config(pair):
         "daily_message_limit": max(1, min(int(pair.get("daily_message_limit", DEFAULT_DAILY_MESSAGES)), MAX_TASK_MESSAGES)),
         "daily_media_mb": max(1, min(int(pair.get("daily_media_mb", DEFAULT_DAILY_MEDIA_MB)), 102400)),
         "auto_forward": bool(pair.get("auto_forward", False)),
+        "dedupe_mode": pair.get("dedupe_mode", "strong"),
+        "max_posts_per_hour": max(0, min(int(pair.get("max_posts_per_hour", 0) or 0), 10000)),
+        "schedule_start": str(pair.get("schedule_start", "")),
+        "schedule_end": str(pair.get("schedule_end", "")),
+        "quiet_start": str(pair.get("quiet_start", "")),
+        "quiet_end": str(pair.get("quiet_end", "")),
+        "protected_behavior": pair.get("protected_behavior", "download"),
     }
+
+
+class StorageLimitError(RuntimeError):
+    """Raised before a download can exceed the temporary disk budget."""
+    def __init__(self, message, required=0, available=0):
+        super().__init__(message)
+        self.required = required
+        self.available = available
+
+
+def _temp_usage_bytes():
+    try:
+        return sum(path.stat().st_size for path in TEMP_DIR.glob("*") if path.is_file())
+    except OSError:
+        return 0
+
+
+def _storage_snapshot():
+    usage = _temp_usage_bytes()
+    try:
+        free = shutil.disk_usage("/tmp").free
+    except OSError:
+        free = 0
+    return {
+        "limit_bytes": TEMP_STORAGE_LIMIT_BYTES,
+        "used_bytes": usage,
+        "available_bytes": max(0, min(TEMP_STORAGE_LIMIT_BYTES - usage, free)),
+        "used_mb": round(usage / 1048576, 2),
+        "limit_mb": round(TEMP_STORAGE_LIMIT_BYTES / 1048576, 2),
+        "available_mb": round(max(0, min(TEMP_STORAGE_LIMIT_BYTES - usage, free)) / 1048576, 2),
+    }
+
+
+def _message_link(source_entity, message):
+    username = getattr(source_entity, "username", None)
+    if username:
+        return f"https://t.me/{username}/{getattr(message, 'id', '')}"
+    channel_id = getattr(source_entity, "id", None)
+    if channel_id:
+        return f"https://t.me/c/{channel_id}/{getattr(message, 'id', '')}"
+    return None
+
+
+def _media_fingerprint(message):
+    media = getattr(message, "media", None)
+    doc = getattr(media, "document", None)
+    if doc:
+        name = next((a.file_name for a in (doc.attributes or [])
+                     if isinstance(a, DocumentAttributeFilename)), "")
+        return f"document:{getattr(doc, 'id', '')}:{getattr(doc, 'size', 0)}:{name}:{getattr(doc, 'mime_type', '')}"
+    photo = getattr(media, "photo", None)
+    if photo:
+        return f"photo:{getattr(photo, 'id', '')}:{getattr(photo, 'access_hash', '')}"
+    return ""
+
+
+def _strong_dedupe_key(pair_id, message):
+    """Stable identity across reruns, even if caption/message IDs differ."""
+    fingerprint = _media_fingerprint(message)
+    if fingerprint:
+        return f"{pair_id}:media:{hashlib.sha256(fingerprint.encode()).hexdigest()}"
+    text = re.sub(r"\s+", " ", (message.text or "").strip().lower())
+    return f"{pair_id}:text:{hashlib.sha256(text.encode()).hexdigest()}"
+
+
+def _time_in_window(now, start, end):
+    if not start or not end:
+        return False
+    try:
+        current = now.hour * 60 + now.minute
+        a = sum(int(x) * (60 if i == 0 else 1) for i, x in enumerate(start.split(":")))
+        b = sum(int(x) * (60 if i == 0 else 1) for i, x in enumerate(end.split(":")))
+        return current >= a and current < b if a <= b else current >= a or current < b
+    except (ValueError, TypeError):
+        return False
+
+
+def _within_schedule(config):
+    now = datetime.now()
+    if _time_in_window(now, config.get("quiet_start"), config.get("quiet_end")):
+        return False
+    start, end = config.get("schedule_start"), config.get("schedule_end")
+    return not start or not end or _time_in_window(now, start, end)
+
+
+def _hourly_budget(pair_id, config, commit=False):
+    bucket = state.setdefault("hourly_usage", {}).setdefault(str(pair_id), {
+        "hour": datetime.now().strftime("%Y-%m-%d-%H"), "count": 0
+    })
+    current_hour = datetime.now().strftime("%Y-%m-%d-%H")
+    if bucket.get("hour") != current_hour:
+        bucket.update({"hour": current_hour, "count": 0})
+    allowed = not config.get("max_posts_per_hour") or bucket["count"] < config["max_posts_per_hour"]
+    if allowed and commit:
+        bucket["count"] += 1
+    return allowed, bucket
 
 
 def _message_allowed(message, config):
@@ -346,6 +463,26 @@ def _dedupe_key(pair_id, message):
     return hashlib.sha256(raw.encode("utf-8", "ignore")).hexdigest()
 
 
+def _is_duplicate(pair_id, message):
+    """Check source ID mapping plus stable media/text identities."""
+    dedupe = state.setdefault("dedupe", {})
+    keys = {_dedupe_key(pair_id, message), _strong_dedupe_key(pair_id, message)}
+    fingerprint = _media_fingerprint(message)
+    if fingerprint:
+        keys.add(fingerprint)
+    return any(key in dedupe for key in keys)
+
+
+def _record_dedupe(pair_id, message):
+    stamp = datetime.now().isoformat(timespec="seconds")
+    dedupe = state.setdefault("dedupe", {})
+    dedupe[_dedupe_key(pair_id, message)] = stamp
+    dedupe[_strong_dedupe_key(pair_id, message)] = stamp
+    fingerprint = _media_fingerprint(message)
+    if fingerprint:
+        dedupe[fingerprint] = stamp
+
+
 def _remember_mapping(pair_id, source_id, sent):
     target_id = getattr(sent, "id", None)
     if target_id:
@@ -404,6 +541,14 @@ async def _task_worker():
                 if _task_queue:
                     state["running"] = True
                 save_state(state)
+                if state.get("notification_settings", {}).get(
+                    "task_complete" if task["status"] == "complete" else "task_failed", True
+                ):
+                    await _notify_owner(
+                        f"{'✅' if task['status'] == 'complete' else '❌'} Task {task['id']} "
+                        f"{task['status']} — {task.get('current', 0)} processed, "
+                        f"{task.get('stats', {}).get('failed', 0)} failed"
+                    )
     finally:
         _task_worker_running = False
         state["running"] = bool(_task_queue)
@@ -456,7 +601,18 @@ async def fast_download(media, progress_cb=None) -> str:
     File ko RAM mein nahi, disk (/tmp) pe download karta hai.
     Returns: tmp file path (str). Caller ka zimma hai delete karna.
     """
-    # Temp file banao
+    TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    total_size = 0
+    if isinstance(media, MessageMediaDocument) and media.document:
+        total_size = media.document.size or 0
+    snapshot = _storage_snapshot()
+    if total_size and total_size > snapshot["available_bytes"]:
+        raise StorageLimitError(
+            f"Temporary storage limit reached: need {total_size / 1048576:.1f} MB, "
+            f"available {snapshot['available_mb']:.1f} MB",
+            total_size, snapshot["available_bytes"]
+        )
+    # Temp file banao inside managed directory so accounting/cleanup works.
     suffix = ".tmp"
     if isinstance(media, MessageMediaDocument) and media.document:
         for attr in media.document.attributes:
@@ -472,12 +628,8 @@ async def fast_download(media, progress_cb=None) -> str:
     elif isinstance(media, MessageMediaPhoto):
         suffix = ".jpg"
 
-    tmp_fd, tmp_path = tempfile.mkstemp(suffix=suffix, dir="/tmp")
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=suffix, dir=str(TEMP_DIR))
     os.close(tmp_fd)
-
-    total_size = 0
-    if isinstance(media, MessageMediaDocument) and media.document:
-        total_size = media.document.size
 
     downloaded = [0]
     _last_cb   = [0.0]
@@ -1300,7 +1452,7 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
                     album = [item for item in album if _message_allowed(item, config)]
                     album = [
                         item for item in album
-                        if _dedupe_key(pair_id, item) not in state.setdefault("dedupe", {})
+                        if not _is_duplicate(pair_id, item)
                     ]
                     if album and all(_daily_budget(pair_id, config, item)[0] for item in album):
                         sent_album = await send_album(
@@ -1311,7 +1463,7 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
                         for index, item in enumerate(album):
                             sent_item = sent_album[min(index, len(sent_album) - 1)] if sent_album else None
                             _remember_mapping(pair_id, item.id, sent_item)
-                            state.setdefault("dedupe", {})[_dedupe_key(pair_id, item)] = datetime.now().isoformat(timespec="seconds")
+                            _record_dedupe(pair_id, item)
                             stats[get_msg_type(item)] = stats.get(get_msg_type(item), 0) + 1
                             _daily_budget(pair_id, config, item, commit=True)
                         count += len(album)
@@ -1329,7 +1481,7 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
                 continue
             dedupe = state.setdefault("dedupe", {})
             dkey = _dedupe_key(pair_id, message)
-            if dkey in dedupe:
+            if _is_duplicate(pair_id, message):
                 stats["duplicates"] = stats.get("duplicates", 0) + 1
                 _log_live(f"⏭️ Duplicate skipped ID={message.id}")
                 continue
@@ -1471,7 +1623,7 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
 
                 if sent:
                     _remember_mapping(pair_id, message.id, sent)
-                    dedupe[dkey] = datetime.now().isoformat(timespec="seconds")
+                    _record_dedupe(pair_id, message)
                     # Keep the latest IDs only; this prevents unbounded state growth.
                     if len(dedupe) > 10000:
                         for old_key in list(dedupe)[:2000]:
@@ -1533,6 +1685,8 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
             except FloodWaitError as e:
                 wait = e.seconds + 10
                 logger.warning(f"FloodWait {wait}s after msg_id={message.id}")
+                if state.get("notification_settings", {}).get("flood_wait", True):
+                    await _notify_owner(f"⚠️ FloodWait warning: waiting {wait}s after message {message.id}")
                 await edit_msg(
                     f"⏸️ *FloodWait!*\n\n"
                     f"Telegram ne slow karne kaha\n"
@@ -1558,6 +1712,25 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
                 state["running"] = False
                 save_state(state)
                 return
+
+            except StorageLimitError as e:
+                failed += 1
+                stats["failed"] = failed
+                link = _message_link(source_entity, message)
+                record = {
+                    "task_id": task_id, "pair_id": pair_id, "message_id": message.id,
+                    "reason": str(e), "link": link, "created_at": datetime.now().isoformat(timespec="seconds")
+                }
+                state.setdefault("oversized_messages", []).append(record)
+                state["oversized_messages"] = state["oversized_messages"][-500:]
+                state["stats"] = stats
+                save_state(state)
+                _log_live(f"🛑 Storage blocked ID={message.id}: {e}")
+                alert = f"🛑 Storage limit: task {task_id or 'sync'}, message {message.id}\n{e}"
+                alert += f"\nLink: {link}" if link else "\nLink unavailable (private channel permission)."
+                await _notify_owner(alert)
+                await asyncio.sleep(1)
+                continue
 
             except (FileReferenceExpiredError, MediaInvalidError) as e:
                 failed += 1
@@ -1659,6 +1832,9 @@ async def send_message(target, message, on_progress=None, config=None, source_ti
         getattr(source_entity, "noforwards", False)
         or getattr(message, "noforwards", False)
     )
+    if source_restricted and config.get("protected_behavior") == "skip":
+        _log_live(f"⏭️ Protected-content skipped ID={message.id}")
+        return False
     try:
         if source_restricted:
             raise ValueError("source channel has forwarding protection")
@@ -1817,6 +1993,13 @@ async def auto_forward_handler(event):
                     continue
                 handled_routes.add(route_key)
                 pair_config = _pair_config(pair)
+                if not _within_schedule(pair_config):
+                    _log_live(f"⏸️ Auto-forward quiet/schedule window skipped ID={message.id}")
+                    continue
+                hourly_ok, _ = _hourly_budget(pair.get("id"), pair_config)
+                if not hourly_ok:
+                    _log_live(f"⏸️ Auto-forward hourly limit reached for {pair.get('target')}")
+                    continue
                 if not _message_allowed(message, pair_config):
                     _log_live(f"⏭️ Auto-forward filter skipped ID={message.id}")
                     continue
@@ -1835,6 +2018,8 @@ async def auto_forward_handler(event):
                 if sent:
                     sent_count += 1
                     _daily_budget(route_key[0], pair_config, message, commit=True)
+                    _hourly_budget(pair.get("id"), pair_config, commit=True)
+                    _record_dedupe(pair.get("id", "default"), message)
                     auto_stats["sent"] += 1
                     _log_live(f"⚡ Auto-forwarded ID={message.id} → {pair.get('target_title', pair['target'])}")
                 else:
@@ -1905,17 +2090,25 @@ async def _notify_owner(text):
 
 async def health_monitor():
     while True:
-        await asyncio.sleep(300)
+        await asyncio.sleep(60)
         snapshot = {}
-        for label, channel in (("source", state.get("source")), ("target", state.get("target"))):
-            if not channel:
-                snapshot[label] = "not configured"
-                continue
+        for pair in state.get("pairs", []):
+            health = {"source_accessible": False, "target_writable": False,
+                      "protected": False, "last_success": pair.get("last_success"),
+                      "last_error": pair.get("last_error")}
             try:
-                await client.get_entity(channel)
-                snapshot[label] = "ok"
+                source = await client.get_entity(pair["source"])
+                health["source_accessible"] = True
+                health["protected"] = bool(getattr(source, "noforwards", False))
             except Exception as exc:
-                snapshot[label] = type(exc).__name__
+                health["last_error"] = f"source: {type(exc).__name__}"
+            try:
+                target = await client.get_entity(pair["target"])
+                health["target_writable"] = not bool(getattr(target, "default_banned_rights", None)
+                                                     and getattr(target.default_banned_rights, "send_messages", False))
+            except Exception as exc:
+                health["last_error"] = f"target: {type(exc).__name__}"
+            snapshot[str(pair["id"])] = health
         connected = client.is_connected()
         snapshot["login"] = "ok" if connected else "offline"
         if snapshot != _health_snapshot:
@@ -1993,6 +2186,13 @@ async def _create_pair(payload):
         "daily_message_limit": max(1, min(int(payload.get("daily_message_limit", DEFAULT_DAILY_MESSAGES)), MAX_TASK_MESSAGES)),
         "daily_media_mb": max(1, min(int(payload.get("daily_media_mb", DEFAULT_DAILY_MEDIA_MB)), 102400)),
         "auto_forward": bool(payload.get("auto_forward", False)),
+        "dedupe_mode": str(payload.get("dedupe_mode", "strong")),
+        "max_posts_per_hour": max(0, min(int(payload.get("max_posts_per_hour", 0) or 0), 10000)),
+        "schedule_start": str(payload.get("schedule_start", "")),
+        "schedule_end": str(payload.get("schedule_end", "")),
+        "quiet_start": str(payload.get("quiet_start", "")),
+        "quiet_end": str(payload.get("quiet_end", "")),
+        "protected_behavior": str(payload.get("protected_behavior", "download")),
     }
     state.setdefault("pairs", []).append(pair)
     save_state(state)
@@ -2009,7 +2209,7 @@ async def _dry_run_pair(pair, mode="full", limit=None, min_id=0):
     ):
         messages.append(message)
     allowed = [message for message in messages if _message_allowed(message, config)]
-    duplicates = [message for message in allowed if _dedupe_key(pair["id"], message) in state.get("dedupe", {})]
+    duplicates = [message for message in allowed if _is_duplicate(pair["id"], message)]
     media_mb = sum(_media_size_mb(message) for message in allowed)
     return {
         "pair": pair.get("name", pair["id"]),
@@ -2079,6 +2279,10 @@ def _status_payload():
         },
         "health": state.get("health", {}),
         "transfer": state.get("transfer"),
+        "storage": _storage_snapshot(),
+        "pair_health": state.get("health", {}),
+        "oversized_messages": state.get("oversized_messages", [])[-20:],
+        "templates": state.get("templates", {}),
         "uptime_seconds": elapsed,
         "uptime": f"{h}h {m}m {s}s" if h else f"{m}m {s}s",
     }
@@ -2178,11 +2382,13 @@ def api_delete_pair(pair_id):
         if not pair:
             return jsonify({"ok": False, "error": "Pair not found"})
         payload = request.json or {}
-        for key in ("rate_profile", "rate_delay", "max_messages",
+        for key in ("name", "rate_profile", "rate_delay", "max_messages",
                     "daily_message_limit", "daily_media_mb", "auto_forward",
                     "caption_prefix", "caption_suffix", "remove_links",
                     "remove_source_name", "include_keywords", "exclude_keywords",
-                    "allowed_types"):
+                    "allowed_types", "dedupe_mode", "max_posts_per_hour",
+                    "schedule_start", "schedule_end", "quiet_start", "quiet_end",
+                    "protected_behavior"):
             if key in payload:
                 pair[key] = payload[key]
         save_state(state)
@@ -2193,6 +2399,55 @@ def api_delete_pair(pair_id):
         return jsonify({"ok": False, "error": "Pair not found"})
     save_state(state)
     return jsonify({"ok": True})
+
+
+@flask_app.route("/api/pairs/<pair_id>/dedupe", methods=["POST"])
+def api_pair_dedupe(pair_id):
+    """Clear identities for an explicit 'Copy again' action."""
+    if not _pair_by_id(pair_id):
+        return jsonify({"ok": False, "error": "Pair not found"}), 404
+    prefix = f"{pair_id}:"
+    dedupe = state.setdefault("dedupe", {})
+    removed = sum(1 for key in list(dedupe) if str(key).startswith(prefix))
+    for key in list(dedupe):
+        if str(key).startswith(prefix):
+            dedupe.pop(key, None)
+    state.setdefault("message_map", {}).pop(str(pair_id), None)
+    save_state(state)
+    _log_live(f"🔁 Copy again enabled for pair {pair_id}; cleared {removed} identities")
+    return jsonify({"ok": True, "removed": removed})
+
+
+@flask_app.route("/api/storage/cleanup", methods=["POST"])
+def api_storage_cleanup():
+    removed = 0
+    TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    for path in TEMP_DIR.glob("*"):
+        try:
+            if path.is_file():
+                path.unlink()
+                removed += 1
+        except OSError:
+            pass
+    _log_live(f"🧹 Temporary storage cleanup removed {removed} file(s)")
+    return jsonify({"ok": True, "removed": removed, "storage": _storage_snapshot()})
+
+
+@flask_app.route("/api/templates", methods=["GET", "POST", "DELETE"])
+def api_templates():
+    templates = state.setdefault("templates", {})
+    if request.method == "GET":
+        return jsonify({"ok": True, "templates": templates})
+    payload = request.json or {}
+    name = str(payload.get("name", "")).strip()
+    if not name:
+        return jsonify({"ok": False, "error": "Template name is required"}), 400
+    if request.method == "DELETE":
+        templates.pop(name, None)
+    else:
+        templates[name] = {key: value for key, value in payload.items() if key != "name"}
+    save_state(state)
+    return jsonify({"ok": True, "templates": templates})
 
 
 @flask_app.route("/api/sync", methods=["POST"])
@@ -2496,7 +2751,9 @@ async def main():
     print(f"🔧 Workers: {PARALLEL_WORKERS} | Chunk: {CHUNK_SIZE//1024}KB | Connection: TcpAbridged")
 
     # Build Telegram Bot
+    global _bot_application
     app = Application.builder().token(BOT_TOKEN).build()
+    _bot_application = app
 
     app.add_handler(CommandHandler("start", bot_start))
     app.add_handler(CommandHandler("help", bot_help))
@@ -2521,6 +2778,7 @@ async def main():
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
+    asyncio.create_task(health_monitor())
 
     await client.run_until_disconnected()
 

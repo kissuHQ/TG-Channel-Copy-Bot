@@ -123,6 +123,16 @@
           <label><input class="pair-type" type="checkbox" value="video" checked/> Videos</label>
           <label><input class="pair-type" type="checkbox" value="doc" checked/> Documents</label>
         </div>
+        <div class="input-row pair-input">
+          <input id="pair-schedule-start" type="time" title="Schedule start"/>
+          <input id="pair-schedule-end" type="time" title="Schedule end"/>
+          <input id="pair-hourly" type="number" min="0" max="10000" value="0" title="Maximum posts per hour" placeholder="Posts/hour (0=off)"/>
+        </div>
+        <div class="input-row pair-input">
+          <input id="pair-quiet-start" type="time" title="Quiet hours start"/>
+          <input id="pair-quiet-end" type="time" title="Quiet hours end"/>
+          <select id="pair-protected" title="Protected-content behavior"><option value="download">Download + upload</option><option value="skip">Skip protected content</option></select>
+        </div>
         <button class="btn-primary full-btn" onclick="addPair()">Add pair</button>
         <div id="pair-list" class="task-list"><div class="hint">No pairs yet.</div></div>
       </div>
@@ -228,6 +238,15 @@
           <div class="stat-item"><span class="stat-icon">📎</span><span class="stat-val" id="s-other">0</span><span class="stat-lbl">Other</span></div>
           <div class="stat-item"><span class="stat-icon">❌</span><span class="stat-val" id="s-failed">0</span><span class="stat-lbl">Failed</span></div>
         </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">🩺 Channel Health</div>
+        <div id="health-list" class="task-list"><div class="hint">Health check pending…</div></div>
+        <div class="divider"></div>
+        <div class="panel-title">💾 Temporary Storage</div>
+        <div id="storage-status" class="hint">Storage status pending…</div>
+        <button class="mini-btn" onclick="cleanupStorage()">Clean temporary files</button>
       </div>
 
       <!-- ACTIVITY LOG -->

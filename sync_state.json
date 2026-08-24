@@ -15,5 +15,59 @@
   },
   "current_id": 4,
   "total_msgs": 1649,
-  "last_synced_id": 356
+  "last_synced_id": 356,
+  "auto_forward": false,
+  "tasks": [],
+  "auto_stats": {
+    "sent": 0,
+    "failed": 0
+  },
+  "pairs": [
+    {
+      "id": "default",
+      "name": "Default pair",
+      "source": -1002718041215,
+      "target": -1003594349284,
+      "source_title": "CineVerse Hub Official",
+      "target_title": "CineVerse Hub Backup",
+      "allowed_types": [
+        "text",
+        "photo",
+        "video",
+        "doc",
+        "other"
+      ],
+      "include_keywords": [],
+      "exclude_keywords": [],
+      "caption_prefix": "",
+      "caption_suffix": "",
+      "remove_links": false,
+      "remove_source_name": false,
+      "rate_delay": 3
+    }
+  ],
+  "dedupe": {},
+  "task_controls": {},
+  "message_map": {},
+  "media_fingerprints": {},
+  "pair_health": {},
+  "oversized_messages": [],
+  "templates": {},
+  "notification_settings": {
+    "task_complete": true,
+    "task_failed": true,
+    "flood_wait": true,
+    "disconnect": true,
+    "daily_summary": false
+  },
+  "health": {
+    "default": {
+      "source_accessible": true,
+      "target_writable": true,
+      "protected": false,
+      "last_success": null,
+      "last_error": null
+    },
+    "login": "ok"
+  }
 }
