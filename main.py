@@ -87,6 +87,7 @@ BATCH_DELAY  = 10      # seconds after each batch
 MIN_RATE_DELAY = 3
 MAX_BATCH_TASKS = 5
 MAX_TASK_MESSAGES = 5000
+TASK_PRIORITIES = {"low": 10, "normal": 20, "high": 30}
 
 LOG_FILE     = "sync.log"
 
@@ -201,6 +202,7 @@ def _task_view(task):
     return {
         "id": task["id"],
         "mode": task.get("mode", "full"),
+        "priority": task.get("priority", "normal"),
         "source": task.get("source_title", task.get("source")),
         "target": task.get("target_title", task.get("target")),
         "status": task.get("status", "queued"),
@@ -231,6 +233,8 @@ def _pair_config(pair):
         "remove_links": bool(pair.get("remove_links")),
         "remove_source_name": bool(pair.get("remove_source_name")),
         "rate_delay": max(MIN_RATE_DELAY, min(float(pair.get("rate_delay", MSG_DELAY)), 300)),
+        "max_messages": max(1, min(int(pair.get("max_messages", MAX_TASK_MESSAGES)), MAX_TASK_MESSAGES)),
+        "auto_forward": bool(pair.get("auto_forward", False)),
     }
 
 
@@ -283,7 +287,13 @@ async def _task_worker():
     _task_worker_running = True
     try:
         while _task_queue:
-            task = _task_queue.popleft()
+            ordered = sorted(
+                enumerate(_task_queue),
+                key=lambda item: -TASK_PRIORITIES.get(item[1].get("priority", "normal"), 20)
+            )
+            selected_index = ordered[0][0]
+            task = _task_queue[selected_index]
+            del _task_queue[selected_index]
             task["status"] = "running"
             state["active_task_id"] = task["id"]
             state["running"] = True
@@ -331,7 +341,7 @@ async def _task_worker():
 
 def _queue_sync(source, target, reverse=True, min_id=0, limit=None,
                 progress_msg=None, is_bot=False, mode="full", pair_id=None,
-                config=None):
+                config=None, priority="normal"):
     pair = _pair_by_id(pair_id)
     task = {
         "id": uuid.uuid4().hex[:8],
@@ -343,6 +353,7 @@ def _queue_sync(source, target, reverse=True, min_id=0, limit=None,
         "min_id": min_id,
         "limit": limit,
         "mode": mode,
+        "priority": priority if priority in TASK_PRIORITIES else "normal",
         "pair_id": pair_id or "default",
         "config": config or _pair_config(_pair_by_id(pair_id)),
         "progress_msg": progress_msg or WebEvent(),
@@ -351,6 +362,12 @@ def _queue_sync(source, target, reverse=True, min_id=0, limit=None,
         "created_at": datetime.now().isoformat(timespec="seconds"),
     }
     _task_queue.append(task)
+    ordered = sorted(
+        _task_queue,
+        key=lambda item: -TASK_PRIORITIES.get(item.get("priority", "normal"), 20)
+    )
+    _task_queue.clear()
+    _task_queue.extend(ordered)
     state["tasks"] = state.get("tasks", []) + [_task_view(task)]
     save_state(state)
     # Web routes run in Flask's thread, while bot commands run on Telegram's
@@ -1152,7 +1169,8 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
         target_entity = await client.get_entity(target)
 
         total = await client.get_messages(source_entity, limit=0)
-        effective_limit = min(limit, MAX_TASK_MESSAGES) if limit else MAX_TASK_MESSAGES
+        pair_limit = config.get("max_messages", MAX_TASK_MESSAGES)
+        effective_limit = min(limit, pair_limit) if limit else pair_limit
         total_count = min(total.total, effective_limit)
         state["total_msgs"] = total_count
         save_state(state)
@@ -1640,31 +1658,62 @@ def _telegram_chat_id(entity):
 
 @client.on(events.NewMessage)
 async def auto_forward_handler(event):
-    """Mirror new source posts immediately, using the same copy/fallback path."""
-    if not state.get("auto_forward") or not state.get("source") or not state.get("target"):
-        return
+    """Mirror every new post for enabled pairs, one route at a time."""
     try:
-        source_entity = await client.get_entity(state["source"])
-        if event.chat_id != _telegram_chat_id(source_entity):
-            return
-        # A single handler invocation per Telegram update, even after reconnects.
         message = event.message
         if not message:
             return
+        routes = []
+        for pair in state.get("pairs", []):
+            if not pair.get("auto_forward"):
+                continue
+            source_entity = await client.get_entity(pair["source"])
+            if event.chat_id == _telegram_chat_id(source_entity):
+                routes.append((pair, source_entity))
+
+        # Preserve the older global toggle for the default source/target pair.
+        if state.get("auto_forward") and state.get("source") and state.get("target"):
+            source_entity = await client.get_entity(state["source"])
+            if event.chat_id == _telegram_chat_id(source_entity):
+                legacy = {
+                    "source": state["source"], "target": state["target"],
+                    "source_title": getattr(source_entity, "title", str(state["source"])),
+                    "target_title": state.get("target_title", str(state["target"])),
+                    "rate_delay": MSG_DELAY,
+                }
+                routes.append((legacy, source_entity))
+        if not routes:
+            return
+
+        sent_count = 0
         async with _auto_forward_lock:
-            target = await client.get_entity(state["target"])
-            sent = await send_message(
-                target, message, source_title=getattr(source_entity, "title", ""),
-                source_entity=source_entity
-            )
-            auto_stats = state.setdefault("auto_stats", {"sent": 0, "failed": 0})
-            if sent:
-                auto_stats["sent"] += 1
-                _log_live(f"⚡ Auto-forwarded ID={message.id} (no forward tag)")
-            else:
-                auto_stats["failed"] += 1
-                _log_live(f"❌ Auto-forward failed ID={message.id}")
-            state["auto_stats"] = auto_stats
+            handled_routes = set()
+            for pair, source_entity in routes:
+                route_key = (str(pair.get("source")), str(pair.get("target")))
+                if route_key in handled_routes:
+                    continue
+                handled_routes.add(route_key)
+                pair_config = _pair_config(pair)
+                if not _message_allowed(message, pair_config):
+                    _log_live(f"⏭️ Auto-forward filter skipped ID={message.id}")
+                    continue
+                target = await client.get_entity(pair["target"])
+                sent = await send_message(
+                    target, message,
+                    config=pair_config,
+                    source_title=pair.get("source_title", ""),
+                    source_entity=source_entity
+                )
+                auto_stats = state.setdefault("auto_stats", {"sent": 0, "failed": 0})
+                if sent:
+                    sent_count += 1
+                    auto_stats["sent"] += 1
+                    _log_live(f"⚡ Auto-forwarded ID={message.id} → {pair.get('target_title', pair['target'])}")
+                else:
+                    auto_stats["failed"] += 1
+                    _log_live(f"❌ Auto-forward failed ID={message.id}")
+                state["auto_stats"] = auto_stats
+                await asyncio.sleep(pair_config["rate_delay"])
             state["auto_last_id"] = message.id
             save_state(state)
     except Exception as exc:
@@ -1808,6 +1857,8 @@ async def _create_pair(payload):
         "remove_links": bool(payload.get("remove_links")),
         "remove_source_name": bool(payload.get("remove_source_name")),
         "rate_delay": max(MIN_RATE_DELAY, min(float(payload.get("rate_delay", MSG_DELAY)), 300)),
+        "max_messages": max(1, min(int(payload.get("max_messages", MAX_TASK_MESSAGES)), MAX_TASK_MESSAGES)),
+        "auto_forward": bool(payload.get("auto_forward", False)),
     }
     state.setdefault("pairs", []).append(pair)
     save_state(state)
@@ -2033,10 +2084,27 @@ def api_create_task():
         return jsonify({"ok": False, "error": f"Last N must be between 1 and {MAX_TASK_MESSAGES}"})
     if mode == "from_id" and min_id < 1:
         return jsonify({"ok": False, "error": "From ID must be a positive message ID"})
+    priority = str(payload.get("priority", "normal")).lower()
+    if priority not in TASK_PRIORITIES:
+        return jsonify({"ok": False, "error": "Priority must be low, normal, or high"})
+    if payload.get("allow_duplicate") is not True:
+        duplicates = [
+            task for task in state.get("tasks", [])
+            if task.get("pair_id") in requested_ids
+            and task.get("mode") == mode
+            and task.get("status") in {"queued", "running", "paused"}
+        ]
+        if duplicates:
+            return jsonify({
+                "ok": False,
+                "code": "duplicate",
+                "error": "A similar task is already queued or running",
+                "duplicates": [_task_view(task) for task in duplicates[:5]],
+            })
     tasks = [
         _queue_sync(
             pair["source"], pair["target"], mode != "last", min_id, limit,
-            WebEvent(), False, mode, pair["id"], _pair_config(pair)
+            WebEvent(), False, mode, pair["id"], _pair_config(pair), priority
         )
         for pair in pairs
     ]
@@ -2065,6 +2133,51 @@ def api_task_control(task_id):
         task["status"] = "paused" if paused else ("running" if task_id == state.get("active_task_id") else "queued")
     save_state(state)
     return jsonify({"ok": True, "task": task})
+
+
+@flask_app.route("/api/tasks/bulk", methods=["POST"])
+def api_tasks_bulk():
+    payload = request.json or {}
+    task_ids = [str(value) for value in payload.get("task_ids", []) if value]
+    action = payload.get("action")
+    if not task_ids or action not in {"pause", "resume", "cancel"}:
+        return jsonify({"ok": False, "error": "Choose tasks and a valid action"})
+    changed = []
+    for task in state.get("tasks", []):
+        if task.get("id") not in task_ids:
+            continue
+        task_id = task["id"]
+        if action == "cancel":
+            state.setdefault("task_controls", {})[task_id] = {"cancelled": True, "paused": False}
+            for queued in list(_task_queue):
+                if queued["id"] == task_id:
+                    _task_queue.remove(queued)
+            task["status"] = "cancelled"
+        else:
+            paused = action == "pause"
+            state.setdefault("task_controls", {}).setdefault(task_id, {})["paused"] = paused
+            task["status"] = "paused" if paused else (
+                "running" if task_id == state.get("active_task_id") else "queued"
+            )
+        changed.append(task)
+    save_state(state)
+    return jsonify({"ok": True, "changed": len(changed), "tasks": changed})
+
+
+@flask_app.route("/api/tasks/reorder", methods=["POST"])
+def api_tasks_reorder():
+    ordered_ids = [str(value) for value in (request.json or {}).get("task_ids", []) if value]
+    if not ordered_ids:
+        return jsonify({"ok": False, "error": "Task order is required"})
+    queued = {task["id"]: task for task in _task_queue}
+    if set(ordered_ids) - set(queued):
+        return jsonify({"ok": False, "error": "Only queued tasks can be reordered"})
+    if set(ordered_ids) != set(queued):
+        return jsonify({"ok": False, "error": "Include every queued task exactly once"})
+    _task_queue.clear()
+    _task_queue.extend(queued[task_id] for task_id in ordered_ids)
+    save_state(state)
+    return jsonify({"ok": True, "queue_size": len(_task_queue)})
 
 
 @flask_app.route("/api/autoforward", methods=["POST"])

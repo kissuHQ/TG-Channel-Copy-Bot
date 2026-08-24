@@ -144,6 +144,8 @@ button:disabled { opacity: .4; cursor: not-allowed; }
 .divider { border-top: 1px solid var(--border); margin: 16px 0; }
 .task-list { display:flex; flex-direction:column; gap:8px; max-height:260px; overflow:auto; }
 .task-item { background:#111; border:1px solid var(--border); border-radius:8px; padding:9px 10px; font-size:12px; }
+.task-select { margin-right:7px; accent-color:var(--accent); vertical-align:middle; }
+.task-bulk-controls { margin-top:10px; }
 .task-route { color:#bbb; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin-top:4px; }
 .task-mode { color:var(--muted); font-size:10px; text-transform:uppercase; margin-top:3px; }
 .task-status { float:right; border-radius:999px; padding:2px 7px; font-size:10px; text-transform:uppercase; }

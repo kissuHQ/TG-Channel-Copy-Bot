@@ -110,6 +110,7 @@ function renderPairs(pairs) {
   list.innerHTML = pairs.map(p => `<div class="task-item">
     <strong>${escapeHtml(p.name)}</strong>
     <div class="task-route">${escapeHtml(p.source_title)} → ${escapeHtml(p.target_title)}</div>
+    <div class="task-mode">${p.auto_forward ? '⚡ auto-forward on' : 'auto-forward off'} · ${p.rate_delay || 3}s delay · max ${p.max_messages || 5000}/run</div>
     <button class="mini-danger" onclick="deletePair('${escapeHtml(p.id)}')">Delete</button>
   </div>`).join('');
     select.innerHTML = pairs.map(p => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name)} — ${escapeHtml(p.source_title)} → ${escapeHtml(p.target_title)}</option>`).join('');
@@ -122,14 +123,17 @@ function renderTasks(tasks) {
     box.innerHTML = '<div class="hint">No tasks yet.</div>';
     return;
   }
-  box.innerHTML = tasks.slice(-12).reverse().map(task => {
+  window._dashboardTasks = tasks;
+  box.innerHTML = tasks.slice(-20).reverse().map(task => {
     const statusClass = task.status === 'complete' ? 'done' :
                         task.status === 'failed' ? 'failed' :
                         task.status === 'running' ? 'running' : 'queued';
     return `<div class="task-item">
+      <input class="task-select" type="checkbox" value="${escapeHtml(task.id)}" aria-label="Select task ${escapeHtml(task.id)}"/>
       <div><strong>${escapeHtml(task.id)}</strong> <span class="task-status ${statusClass}">${escapeHtml(task.status)}</span></div>
       <div class="task-route">${escapeHtml(task.source || 'Source')} → ${escapeHtml(task.target || 'Target')}</div>
-      <div class="task-mode">${escapeHtml(task.mode || 'sync')} · ${escapeHtml(task.pair_id || '')} · sent ${task.stats?.text + task.stats?.photo + task.stats?.video + task.stats?.doc + task.stats?.other || 0} · failed ${task.stats?.failed || 0}</div>
+      <div class="task-mode">${escapeHtml(task.mode || 'sync')} · ${escapeHtml(task.priority || 'normal')} priority · sent ${task.stats?.text + task.stats?.photo + task.stats?.video + task.stats?.doc + task.stats?.other || 0} · failed ${task.stats?.failed || 0}</div>
+      ${task.status === 'queued' ? `<button class="mini-btn" onclick="reorderTask('${escapeHtml(task.id)}','up')">↑</button><button class="mini-btn" onclick="reorderTask('${escapeHtml(task.id)}','down')">↓</button>` : ''}
       ${task.status === 'queued' || task.status === 'running' ? `<button class="mini-danger" onclick="controlTask('${escapeHtml(task.id)}','cancel')">Cancel</button>` : ''}
       ${task.status === 'running' || task.status === 'paused' ? `<button class="mini-btn" onclick="controlTask('${escapeHtml(task.id)}','${task.status === 'paused' ? 'resume' : 'pause'}')">${task.status === 'paused' ? 'Resume' : 'Pause'}</button>` : ''}
     </div>`;
@@ -207,6 +211,9 @@ async function addPair() {
     caption_suffix: document.getElementById('pair-suffix').value,
     remove_links: document.getElementById('pair-links').checked,
     remove_source_name: document.getElementById('pair-source-name').checked,
+    rate_delay: parseInt(document.getElementById('pair-rate').value || '3'),
+    max_messages: parseInt(document.getElementById('pair-max').value || '5000'),
+    auto_forward: document.getElementById('pair-auto').checked,
     allowed_types: [...document.querySelectorAll('.pair-type:checked')].map(x => x.value)
   };
   const data = await api('/api/pairs', payload);
@@ -227,8 +234,35 @@ async function createTask() {
   const mode = document.getElementById('task-mode').value;
   const value = parseInt(document.getElementById('task-limit').value || '0');
   if (!pair_ids.length) return toast('Kam se kam ek pair select karo', true);
-  const data = await api('/api/tasks', {pair_ids, mode, limit: mode === 'last' ? value : 0, min_id: mode === 'from_id' ? value : 0});
+  const priority = document.getElementById('task-priority').value;
+  const payload = {pair_ids, mode, priority, limit: mode === 'last' ? value : 0, min_id: mode === 'from_id' ? value : 0};
+  let data = await api('/api/tasks', payload);
+  if (!data.ok && data.code === 'duplicate' &&
+      confirm('Similar task already exists. Queue another copy anyway?')) {
+    data = await api('/api/tasks', {...payload, allow_duplicate: true});
+  }
   toast(data.ok ? `✅ ${data.created_count} task(s) queue mein add` : '❌ ' + data.error, !data.ok);
+}
+
+async function bulkTasks(action) {
+  const task_ids = [...document.querySelectorAll('.task-select:checked')].map(input => input.value);
+  if (!task_ids.length) return toast('Pehle tasks select karo', true);
+  if (action === 'cancel' && !confirm('Selected tasks cancel karne hain?')) return;
+  const data = await fetch('/api/tasks/bulk', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({task_ids, action})
+  }).then(r => r.json());
+  toast(data.ok ? `✅ ${data.changed} task(s) updated` : '❌ ' + data.error, !data.ok);
+}
+
+async function reorderTask(id, direction) {
+  const queued = (window._dashboardTasks || []).filter(task => task.status === 'queued');
+  const index = queued.findIndex(task => task.id === id);
+  const target = direction === 'up' ? index - 1 : index + 1;
+  if (index < 0 || target < 0 || target >= queued.length) return;
+  [queued[index], queued[target]] = [queued[target], queued[index]];
+  const data = await api('/api/tasks/reorder', {task_ids: queued.map(task => task.id)});
+  toast(data.ok ? '✅ Queue reordered' : '❌ ' + data.error, !data.ok);
 }
 
 function connectDashboard() {
