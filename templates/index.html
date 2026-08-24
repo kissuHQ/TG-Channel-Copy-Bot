@@ -147,13 +147,14 @@
         </div>
         <div class="divider"></div>
         <label class="field-label">Create task for pair</label>
-        <div class="input-row">
-          <select id="task-pair"></select>
+          <div class="input-row">
+           <select id="task-pair" multiple size="4" aria-label="Select one or more pairs"></select>
           <select id="task-mode"><option value="full">Full sync</option><option value="last">Last N</option><option value="from_id">From ID</option></select>
         </div>
+         <div class="hint">Multiple pairs select kar sakte ho (maximum 5). Ctrl/Cmd-click se ek se zyada select karein.</div>
         <div class="input-row">
           <input id="task-limit" type="number" placeholder="N / message ID (optional)"/>
-          <button class="btn-primary" onclick="createTask()">Add task</button>
+           <button class="btn-primary" onclick="createTask()">Add selected tasks</button>
         </div>
       </div>
 

@@ -112,7 +112,8 @@ function renderPairs(pairs) {
     <div class="task-route">${escapeHtml(p.source_title)} → ${escapeHtml(p.target_title)}</div>
     <button class="mini-danger" onclick="deletePair('${escapeHtml(p.id)}')">Delete</button>
   </div>`).join('');
-  select.innerHTML = pairs.map(p => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name)}</option>`).join('');
+    select.innerHTML = pairs.map(p => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name)} — ${escapeHtml(p.source_title)} → ${escapeHtml(p.target_title)}</option>`).join('');
+    [...select.options].forEach((option, index) => option.selected = index === 0);
 }
 
 function renderTasks(tasks) {
@@ -128,7 +129,7 @@ function renderTasks(tasks) {
     return `<div class="task-item">
       <div><strong>${escapeHtml(task.id)}</strong> <span class="task-status ${statusClass}">${escapeHtml(task.status)}</span></div>
       <div class="task-route">${escapeHtml(task.source || 'Source')} → ${escapeHtml(task.target || 'Target')}</div>
-      <div class="task-mode">${escapeHtml(task.mode || 'sync')} · direct ${task.stats?.direct || 0} · fallback ${task.stats?.fallback || 0}</div>
+      <div class="task-mode">${escapeHtml(task.mode || 'sync')} · ${escapeHtml(task.pair_id || '')} · sent ${task.stats?.text + task.stats?.photo + task.stats?.video + task.stats?.doc + task.stats?.other || 0} · failed ${task.stats?.failed || 0}</div>
       ${task.status === 'queued' || task.status === 'running' ? `<button class="mini-danger" onclick="controlTask('${escapeHtml(task.id)}','cancel')">Cancel</button>` : ''}
       ${task.status === 'running' || task.status === 'paused' ? `<button class="mini-btn" onclick="controlTask('${escapeHtml(task.id)}','${task.status === 'paused' ? 'resume' : 'pause'}')">${task.status === 'paused' ? 'Resume' : 'Pause'}</button>` : ''}
     </div>`;
@@ -222,12 +223,12 @@ async function deletePair(id) {
 }
 
 async function createTask() {
-  const pair_id = document.getElementById('task-pair').value;
+  const pair_ids = [...document.getElementById('task-pair').selectedOptions].map(option => option.value);
   const mode = document.getElementById('task-mode').value;
   const value = parseInt(document.getElementById('task-limit').value || '0');
-  if (!pair_id) return toast('Pehle pair add karo', true);
-  const data = await api('/api/tasks', {pair_id, mode, limit: mode === 'last' ? value : 0, min_id: mode === 'from_id' ? value : 0});
-  toast(data.ok ? `✅ Task ${data.task.id} queued` : '❌ ' + data.error, !data.ok);
+  if (!pair_ids.length) return toast('Kam se kam ek pair select karo', true);
+  const data = await api('/api/tasks', {pair_ids, mode, limit: mode === 'last' ? value : 0, min_id: mode === 'from_id' ? value : 0});
+  toast(data.ok ? `✅ ${data.created_count} task(s) queue mein add` : '❌ ' + data.error, !data.ok);
 }
 
 function connectDashboard() {

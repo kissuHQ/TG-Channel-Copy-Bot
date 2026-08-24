@@ -84,6 +84,9 @@ if not SESSION_STRING and Path(SESSION_STRING_FILE).exists():
 MSG_DELAY    = 3        # seconds between messages
 BATCH_SIZE   = 10      # messages per batch
 BATCH_DELAY  = 10      # seconds after each batch
+MIN_RATE_DELAY = 3
+MAX_BATCH_TASKS = 5
+MAX_TASK_MESSAGES = 5000
 
 LOG_FILE     = "sync.log"
 
@@ -227,7 +230,7 @@ def _pair_config(pair):
         "caption_suffix": pair.get("caption_suffix", ""),
         "remove_links": bool(pair.get("remove_links")),
         "remove_source_name": bool(pair.get("remove_source_name")),
-        "rate_delay": max(0, min(float(pair.get("rate_delay", MSG_DELAY)), 300)),
+        "rate_delay": max(MIN_RATE_DELAY, min(float(pair.get("rate_delay", MSG_DELAY)), 300)),
     }
 
 
@@ -1149,7 +1152,8 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
         target_entity = await client.get_entity(target)
 
         total = await client.get_messages(source_entity, limit=0)
-        total_count = total.total if not limit else limit
+        effective_limit = min(limit, MAX_TASK_MESSAGES) if limit else MAX_TASK_MESSAGES
+        total_count = min(total.total, effective_limit)
         state["total_msgs"] = total_count
         save_state(state)
 
@@ -1174,7 +1178,7 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
             source_entity,
             reverse=reverse,
             min_id=min_id,
-            limit=limit
+            limit=effective_limit
         ):
             controls = state.setdefault("task_controls", {})
             control = controls.setdefault(task_id or "legacy", {"paused": False, "cancelled": False})
@@ -1314,7 +1318,8 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
                         sent = await send_message(
                             target_entity, message,
                             on_progress=on_progress if msg_type != "text" else None,
-                            config=config, source_title=src_title
+                            config=config, source_title=src_title,
+                            source_entity=source_entity
                         )
                         break   # success
                     except (FilePartMissingError, TgTimeoutError, ServerError) as retry_err:
@@ -1493,7 +1498,8 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
         await edit_msg(f"❌ Fatal error: {e}")
 
 
-async def send_message(target, message, on_progress=None, config=None, source_title=""):
+async def send_message(target, message, on_progress=None, config=None, source_title="",
+                       source_entity=None):
     # Telegram can often reuse the source media directly. This creates a new
     # message without a forward header and avoids download/upload round trips.
     # Restricted or otherwise non-copyable messages fall back to the existing
@@ -1503,7 +1509,18 @@ async def send_message(target, message, on_progress=None, config=None, source_ti
         config["caption_prefix"], config["caption_suffix"],
         config["remove_links"], config["remove_source_name"],
     ])
+    # Telegram marks protected channels with noforwards. Do not probe a
+    # protected message with a copy request: download and re-upload instead.
+    # This also makes the dashboard behavior deterministic instead of relying
+    # on a failed API call for every restricted post.
+    source_entity = source_entity or getattr(message, "chat", None)
+    source_restricted = bool(
+        getattr(source_entity, "noforwards", False)
+        or getattr(message, "noforwards", False)
+    )
     try:
+        if source_restricted:
+            raise ValueError("source channel has forwarding protection")
         if needs_rewrite:
             raise ValueError("caption rewrite requires upload/copy path")
         sent = await client.send_message(target, message, parse_mode="md", link_preview=False)
@@ -1636,7 +1653,10 @@ async def auto_forward_handler(event):
             return
         async with _auto_forward_lock:
             target = await client.get_entity(state["target"])
-            sent = await send_message(target, message)
+            sent = await send_message(
+                target, message, source_title=getattr(source_entity, "title", ""),
+                source_entity=source_entity
+            )
             auto_stats = state.setdefault("auto_stats", {"sent": 0, "failed": 0})
             if sent:
                 auto_stats["sent"] += 1
@@ -1787,7 +1807,7 @@ async def _create_pair(payload):
         "caption_suffix": str(payload.get("caption_suffix", "")),
         "remove_links": bool(payload.get("remove_links")),
         "remove_source_name": bool(payload.get("remove_source_name")),
-        "rate_delay": max(0, min(float(payload.get("rate_delay", MSG_DELAY)), 300)),
+        "rate_delay": max(MIN_RATE_DELAY, min(float(payload.get("rate_delay", MSG_DELAY)), 300)),
     }
     state.setdefault("pairs", []).append(pair)
     save_state(state)
@@ -1833,6 +1853,11 @@ def _status_payload():
         "auto_stats": state.get("auto_stats", {"sent": 0, "failed": 0}),
         "tasks": state.get("tasks", []),
         "queue_size": len(_task_queue),
+        "limits": {
+            "max_batch_tasks": MAX_BATCH_TASKS,
+            "max_task_messages": MAX_TASK_MESSAGES,
+            "min_rate_delay": MIN_RATE_DELAY,
+        },
         "health": state.get("health", {}),
         "transfer": state.get("transfer"),
         "uptime_seconds": elapsed,
@@ -1983,20 +2008,44 @@ def api_tasks():
 @flask_app.route("/api/tasks", methods=["POST"])
 def api_create_task():
     payload = request.json or {}
-    pair = _pair_by_id(payload.get("pair_id"))
-    if not pair:
-        return jsonify({"ok": False, "error": "Select a valid source-target pair"})
+    requested_ids = payload.get("pair_ids")
+    if requested_ids is None:
+        requested_ids = [payload.get("pair_id")]
+    if not isinstance(requested_ids, list):
+        requested_ids = [requested_ids]
+    requested_ids = list(dict.fromkeys(str(value) for value in requested_ids if value))
+    if not requested_ids:
+        return jsonify({"ok": False, "error": "Select at least one source-target pair"})
+    if len(requested_ids) > MAX_BATCH_TASKS:
+        return jsonify({"ok": False, "error": f"Maximum {MAX_BATCH_TASKS} tasks per request allowed"})
+    pairs = [_pair_by_id(pair_id) for pair_id in requested_ids]
+    if any(pair is None for pair in pairs):
+        return jsonify({"ok": False, "error": "One or more selected pairs are invalid"})
     mode = payload.get("mode", "full")
+    if mode not in {"full", "last", "from_id"}:
+        return jsonify({"ok": False, "error": "Unsupported task mode"})
     try:
         limit = int(payload.get("limit", 0)) or None
         min_id = int(payload.get("min_id", 0))
     except (TypeError, ValueError):
         return jsonify({"ok": False, "error": "Message limits must be numbers"})
-    task = _queue_sync(
-        pair["source"], pair["target"], mode != "last", min_id, limit,
-        WebEvent(), False, mode, pair["id"], _pair_config(pair)
-    )
-    return jsonify({"ok": True, "task": _task_view(task)})
+    if mode == "last" and (limit is None or limit < 1 or limit > MAX_TASK_MESSAGES):
+        return jsonify({"ok": False, "error": f"Last N must be between 1 and {MAX_TASK_MESSAGES}"})
+    if mode == "from_id" and min_id < 1:
+        return jsonify({"ok": False, "error": "From ID must be a positive message ID"})
+    tasks = [
+        _queue_sync(
+            pair["source"], pair["target"], mode != "last", min_id, limit,
+            WebEvent(), False, mode, pair["id"], _pair_config(pair)
+        )
+        for pair in pairs
+    ]
+    return jsonify({
+        "ok": True,
+        "tasks": [_task_view(task) for task in tasks],
+        "task": _task_view(tasks[0]),
+        "created_count": len(tasks),
+    })
 
 
 @flask_app.route("/api/tasks/<task_id>", methods=["PATCH", "DELETE"])
