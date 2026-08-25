@@ -92,7 +92,7 @@ MAX_BATCH_TASKS = 5
 MAX_TASK_MESSAGES = 5000
 TASK_PRIORITIES = {"low": 10, "normal": 20, "high": 30}
 RATE_PROFILES = {"very_safe": 5, "balanced": 3, "slow": 10}
-DEFAULT_DAILY_MESSAGES = 1000
+DEFAULT_DAILY_MESSAGES = MAX_TASK_MESSAGES
 DEFAULT_DAILY_MEDIA_MB = 2048
 # Keep a safety margin on the small Replit disk.  This is a hard temporary
 # storage ceiling, not a promise that the host has this much free space.
@@ -211,6 +211,10 @@ state.setdefault("notification_settings", {
     "task_complete": True, "task_failed": True, "flood_wait": True,
     "disconnect": True, "daily_summary": False,
 })
+for _pair in state.get("pairs", []):
+    # Missing setting means automatic new-post forwarding is enabled.
+    # An explicit False remains disabled.
+    _pair.setdefault("auto_forward", True)
 
 # Sync requests are queued instead of being rejected while another sync runs.
 _task_queue = deque()
@@ -579,7 +583,9 @@ async def _task_worker():
                     task.get("pair_id"), task.get("config"), task["id"],
                     task.get("source_title"), task.get("target_title")
                 )
-                task["status"] = "complete" if not state.get("running") else "complete"
+                task["status"] = (
+                    "partial" if state.pop("_task_partial", False) else "complete"
+                )
             except Exception as exc:
                 task["status"] = "failed"
                 logger.exception("Queued task failed: %s", exc)
@@ -597,11 +603,13 @@ async def _task_worker():
                 if _task_queue:
                     state["running"] = True
                 save_state(state)
-                if state.get("notification_settings", {}).get(
-                    "task_complete" if task["status"] == "complete" else "task_failed", True
-                ):
+                notification_key = "task_failed" if task["status"] == "failed" else "task_complete"
+                if state.get("notification_settings", {}).get(notification_key, True):
+                    status_icon = {"complete": "✅", "partial": "⚠️", "failed": "❌"}.get(
+                        task["status"], "ℹ️"
+                    )
                     await _notify_owner(
-                        f"{'✅' if task['status'] == 'complete' else '❌'} Task {task['id']} "
+                        f"{status_icon} Task {task['id']} "
                         f"{task['status']} — {task.get('current', 0)} processed, "
                         f"{task.get('stats', {}).get('failed', 0)} failed"
                     )
@@ -755,6 +763,7 @@ async def cmd_help(event):
         "`.resume` — Sync resume karo\n"
         "`.stop` — Sync stop karo\n"
         "`.status` — Live status dekho\n"
+        "`.refresh` — Source refresh karke naye posts copy karo\n"
         "`.reset` — Config reset karo\n"
         "`.help` — Ye menu\n\n"
         "⚠️ Sirf owner (tum) use kar sakte ho"
@@ -812,6 +821,16 @@ async def get_channel_from_event(event):
                 except Exception:
                     pass
     return None, None
+
+
+def _forwarded_chat_id(message):
+    """Support both legacy and modern Bot API forwarded-message fields."""
+    forwarded = getattr(message, "forward_from_chat", None)
+    if forwarded:
+        return getattr(forwarded, "id", None)
+    origin = getattr(message, "forward_origin", None)
+    chat = getattr(origin, "chat", None)
+    return getattr(chat, "id", None)
 
 
 @client.on(events.NewMessage(outgoing=True, pattern=r"^\.setsource(.*)$"))
@@ -1063,6 +1082,63 @@ async def cmd_synclast(event):
     await start_sync_userbot(event, reverse=False, limit=n)
 
 
+async def refresh_sources(progress_msg, is_bot=True):
+    """Queue only messages newer than the last observed source message."""
+    pairs = list(state.get("pairs", []))
+    if not pairs and state.get("source") and state.get("target"):
+        pairs = [{
+            "id": "default",
+            "source": state["source"],
+            "target": state["target"],
+            "source_title": state.get("source_title", str(state["source"])),
+            "target_title": state.get("target_title", str(state["target"])),
+        }]
+    if not pairs:
+        text = "❌ Pehle source aur target set karo."
+        await (progress_msg.edit_text(text) if is_bot else progress_msg.edit(text))
+        return
+
+    queued = []
+    skipped = []
+    source_last_ids = state.setdefault("source_last_ids", {})
+    for pair in pairs:
+        try:
+            source_entity = await client.get_entity(pair["source"])
+            latest = await client.get_messages(source_entity, limit=1)
+            latest_message = latest[0] if latest else None
+            latest_id = getattr(latest_message, "id", 0)
+            pair_id = str(pair.get("id", "default"))
+            last_id = int(source_last_ids.get(pair_id, 0) or 0)
+            if not last_id and pair["source"] == state.get("source"):
+                last_id = int(state.get("last_synced_id", 0) or 0)
+            if latest_id <= last_id:
+                skipped.append(pair.get("name", pair_id))
+                continue
+            queued.append(_queue_sync(
+                pair["source"], pair["target"], True, last_id, None,
+                progress_msg, is_bot, "refresh", pair_id,
+                _pair_config(pair)
+            ))
+        except Exception as exc:
+            logger.warning("Refresh failed for %s: %s", pair.get("source"), exc)
+            skipped.append(f"{pair.get('name', pair.get('id', 'pair'))}: {type(exc).__name__}")
+
+    if queued:
+        summary = f"🔄 {len(queued)} refresh task(s) queued"
+        if skipped:
+            summary += f"\n⏭️ No new posts/error: {len(skipped)}"
+    else:
+        summary = "✅ Source refreshed — koi naya post nahi mila."
+    await (progress_msg.edit_text(summary) if is_bot else progress_msg.edit(summary))
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=r"^\.refresh$"))
+async def cmd_refresh(event):
+    if not is_owner(event.sender_id):
+        return
+    await refresh_sources(event, is_bot=False)
+
+
 # ════════════════════════════════════════════════════════
 #  TELEGRAM BOT COMMANDS (via @BotFather bot)
 # ════════════════════════════════════════════════════════
@@ -1099,11 +1175,12 @@ async def bot_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/tasks — Queue ke tasks dekho\n"
         "/autoforward on|off — New posts automatically copy karo\n"
         "/caption <pair_id> on|off [template] — Caption rules set karo\n"
-        "/setthumbnail <pair_id> — Is command ke reply mein video thumbnail photo bhejo\n"
+        "/setthumbnail <pair_id> — Photo/image ko reply karke thumbnail set karo\n"
         "/pause — Sync pause karo\n"
         "/resume — Sync resume karo\n"
         "/stop — Sync stop karo\n"
         "/status — Live status dekho\n"
+        "/refresh — Source refresh karke naye posts copy karo\n"
         "/reset — Config reset karo\n\n"
         "⚠️ Sirf owner use kar sakta hai",
         parse_mode="Markdown"
@@ -1144,12 +1221,16 @@ async def bot_caption(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def bot_setthumbnail(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not bot_is_owner(update):
         return
-    if not context.args:
+    pair_id = context.args[0] if context.args else None
+    if not pair_id and len(state.get("pairs", [])) == 1:
+        pair_id = state["pairs"][0].get("id")
+    if not pair_id:
         await update.message.reply_text(
-            "Usage: kisi photo ko reply karke /setthumbnail <pair_id> bhejo"
+            "Usage: kisi photo/image ko reply karke /setthumbnail <pair_id> bhejo\n"
+            "Agar sirf ek pair hai to pair ID optional hai."
         )
         return
-    pair = _pair_by_id(context.args[0])
+    pair = _pair_by_id(pair_id)
     if pair and len(context.args) > 1 and context.args[1].lower() in {"off", "disable"}:
         pair["thumbnail_enabled"] = False
         save_state(state)
@@ -1159,12 +1240,21 @@ async def bot_setthumbnail(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Thumbnail set karne ke liye photo ko reply karo.")
         return
     replied = update.message.reply_to_message
-    if not pair or not getattr(replied, "photo", None):
-        await update.message.reply_text("❌ Valid pair ID aur replied photo required hai.")
+    photo = getattr(replied, "photo", None)
+    document = getattr(replied, "document", None)
+    is_image_document = (
+        document
+        and str(getattr(document, "mime_type", "")).lower().startswith("image/")
+    )
+    if not pair or (not photo and not is_image_document):
+        await update.message.reply_text(
+            "❌ Valid pair ID ke saath replied photo ya image file required hai."
+        )
         return
     THUMBNAIL_DIR.mkdir(parents=True, exist_ok=True)
     path = THUMBNAIL_DIR / f"{pair['id']}.jpg"
-    tg_file = await context.bot.get_file(replied.photo[-1].file_id)
+    file_id = photo[-1].file_id if photo else document.file_id
+    tg_file = await context.bot.get_file(file_id)
     await tg_file.download_to_drive(custom_path=str(path))
     pair["thumbnail_path"] = str(path)
     pair["thumbnail_enabled"] = True
@@ -1178,7 +1268,7 @@ async def bot_setsource(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Option 1: Forwarded message se channel detect karo (no args needed)
     if not context.args:
-        fwd_chat = getattr(msg.forward_from_chat, "id", None) if msg.forward_from_chat else None
+        fwd_chat = _forwarded_chat_id(msg)
         if fwd_chat:
             try:
                 entity = await client.get_entity(fwd_chat)
@@ -1225,7 +1315,7 @@ async def bot_settarget(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Option 1: Forwarded message se channel detect karo (no args needed)
     if not context.args:
-        fwd_chat = getattr(msg.forward_from_chat, "id", None) if msg.forward_from_chat else None
+        fwd_chat = _forwarded_chat_id(msg)
         if fwd_chat:
             try:
                 entity = await client.get_entity(fwd_chat)
@@ -1390,6 +1480,13 @@ async def bot_synclast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     asyncio.create_task(start_sync_bot(msg, reverse=False, limit=n))
 
 
+async def bot_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not bot_is_owner(update):
+        return
+    msg = await update.message.reply_text("🔄 Source refresh ho raha hai...")
+    asyncio.create_task(refresh_sources(msg, is_bot=True))
+
+
 async def bot_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not bot_is_owner(update):
         return
@@ -1543,6 +1640,7 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
             min_id=min_id,
             limit=effective_limit
         ):
+            state.setdefault("source_last_ids", {})[str(pair_id)] = message.id
             controls = state.setdefault("task_controls", {})
             control = controls.setdefault(task_id or "legacy", {"paused": False, "cancelled": False})
             if control.get("cancelled") or not state.get("running"):
@@ -1607,6 +1705,9 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
                 continue
             budget_ok, budget_bucket = _daily_budget(pair_id, config, message)
             if not budget_ok:
+                state["_task_partial"] = True
+                state["_task_stop_reason"] = "daily limit reached"
+                save_state(state)
                 _log_live(
                     f"🛑 Daily limit reached for pair {pair_id}: "
                     f"{budget_bucket['messages']} messages / {budget_bucket['media_mb']:.1f} MB"
@@ -1903,8 +2004,14 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
             f"time={_fmt_eta(elapsed_total)}"
         )
 
+        was_partial = bool(state.get("_task_partial"))
+        completion_title = "⚠️ *Sync Stopped at Limit!*" if was_partial else "✅ *Sync Complete!*"
+        stop_note = (
+            "\nDaily message/media limit reached. Limit badhakar ya kal dobara refresh/sync karein.\n"
+            if completion_title.startswith("⚠️") else ""
+        )
         await edit_msg(
-            f"✅ *Sync Complete!*\n\n"
+            f"{completion_title}\n\n"
             f"📥 `{src_title}`\n"
             f"📤 `{tgt_title}`\n\n"
             f"📝 Text:  {stats['text']}   "
@@ -1914,6 +2021,7 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
             f"📎 Other: {stats['other']}   "
             f"❌ Failed: {stats['failed']}\n"
             f"📊 Total:  {count}\n\n"
+            f"{stop_note}"
             f"⏱ Time: {_fmt_eta(elapsed_total)}\n"
             f"🕐 {datetime.now().strftime('%d %b %Y, %I:%M %p')}",
             parse_mode="Markdown"
@@ -2213,6 +2321,7 @@ async def _notify_owner(text):
 
 
 async def health_monitor():
+    global _health_snapshot
     while True:
         await asyncio.sleep(60)
         snapshot = {}
@@ -2235,15 +2344,31 @@ async def health_monitor():
             snapshot[str(pair["id"])] = health
         connected = client.is_connected()
         snapshot["login"] = "ok" if connected else "offline"
-        if snapshot != _health_snapshot:
-            old = dict(_health_snapshot)
-            _health_snapshot.update(snapshot)
-            state["health"] = snapshot
-            save_state(state)
-            if old and snapshot != old:
-                await _notify_owner("⚠️ Channel health changed:\n" + "\n".join(
-                    f"{key}: {value}" for key, value in snapshot.items()
-                ))
+        # Compare only actual health states. Volatile fields such as
+        # last_success/last_error must not trigger a repeated "login: ok".
+        signature = {
+            key: (
+                value if key == "login" else (
+                    value.get("source_accessible"),
+                    value.get("target_writable"),
+                    value.get("protected"),
+                )
+            )
+            for key, value in snapshot.items()
+        }
+        changed = [
+            key for key in set(_health_snapshot) | set(signature)
+            if _health_snapshot.get(key) != signature.get(key)
+        ]
+        first_check = not _health_snapshot
+        _health_snapshot = signature
+        state["health"] = snapshot
+        save_state(state)
+        if changed and not first_check:
+            details = "\n".join(
+                f"{key}: {snapshot.get(key, 'removed')}" for key in sorted(changed)
+            )
+            await _notify_owner("⚠️ Channel health changed:\n" + details)
 
 
 # ── Async helpers ──────────────────────────────────────
@@ -2309,7 +2434,7 @@ async def _create_pair(payload):
         "max_messages": max(1, min(int(payload.get("max_messages", MAX_TASK_MESSAGES)), MAX_TASK_MESSAGES)),
         "daily_message_limit": max(1, min(int(payload.get("daily_message_limit", DEFAULT_DAILY_MESSAGES)), MAX_TASK_MESSAGES)),
         "daily_media_mb": max(1, min(int(payload.get("daily_media_mb", DEFAULT_DAILY_MEDIA_MB)), 102400)),
-        "auto_forward": bool(payload.get("auto_forward", False)),
+        "auto_forward": bool(payload.get("auto_forward", True)),
         "dedupe_mode": str(payload.get("dedupe_mode", "strong")),
         "max_posts_per_hour": max(0, min(int(payload.get("max_posts_per_hour", 0) or 0), 10000)),
         "schedule_start": str(payload.get("schedule_start", "")),
@@ -2946,6 +3071,7 @@ async def main():
     app.add_handler(CommandHandler("sync", bot_sync))
     app.add_handler(CommandHandler("syncfrom", bot_syncfrom))
     app.add_handler(CommandHandler("synclast", bot_synclast))
+    app.add_handler(CommandHandler("refresh", bot_refresh))
     app.add_handler(CommandHandler("tasks", bot_tasks))
     app.add_handler(CommandHandler("autoforward", bot_autoforward))
     app.add_handler(CommandHandler("caption", bot_caption))
