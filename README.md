@@ -1,4 +1,5 @@
 # TG Channel Copy Bot — Archive Bot
+## By PR
 
 Telegram channels ke messages ko source channel se target channel mein safely copy
 karne wala owner-only archive bot. Project ek hi Python process mein:
