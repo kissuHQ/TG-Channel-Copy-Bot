@@ -371,5 +371,4 @@ Confirm karein ki:
 
 ## License
 
-Project mein alag license file na hone par default copyright owner ke paas
-rehta hai. Redistribution se pehle appropriate license add karein.
+License Taken by PR BOT SERVICE'S 
