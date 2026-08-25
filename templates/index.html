@@ -97,6 +97,7 @@
 
       <div class="panel">
         <div class="panel-title">🔗 Source → Target Pairs</div>
+        <div class="settings-section-title">Pair basics</div>
         <div class="input-row"><input id="pair-name" placeholder="Pair name"/></div>
         <div class="input-row pair-input"><input id="pair-source" placeholder="Source @username / -100id"/></div>
         <div class="input-row pair-input"><input id="pair-target" placeholder="Target @username / -100id"/></div>
@@ -104,6 +105,7 @@
         <input id="pair-exclude" class="wide-input" placeholder="Exclude keywords: spam, ad"/>
         <input id="pair-prefix" class="wide-input" placeholder="Caption prefix"/>
         <input id="pair-suffix" class="wide-input" placeholder="Caption suffix"/>
+        <div class="settings-section-title">Limits & scheduling</div>
         <textarea id="pair-caption-template" class="wide-input" rows="3"
           placeholder="Caption template (e.g. 🎬 {filename}&#10;Size: {filesize}&#10;{caption}"></textarea>
         <div class="hint">Placeholders: {caption} {filename} {filesize} {filesize_mb} {message_id} {source} {date} {time} {mime} {type}</div>
@@ -152,6 +154,7 @@
           <input id="pair-quiet-end" type="time" title="Quiet hours end"/>
           <select id="pair-protected" title="Protected-content behavior"><option value="download">Download + upload</option><option value="skip">Skip protected content</option></select>
         </div>
+        <div class="settings-section-title">Content & media</div>
         <button class="btn-primary full-btn" onclick="addPair()">Add pair</button>
         <div id="pair-list" class="task-list"><div class="hint">No pairs yet.</div></div>
       </div>

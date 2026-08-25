@@ -47,9 +47,9 @@ from telethon.errors import (
     SlowModeWaitError, BadMessageError, TimeoutError as TgTimeoutError,
     ServerError,
 )
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application, CommandHandler, ContextTypes
+    Application, CommandHandler, CallbackQueryHandler, ContextTypes
 )
 from telethon.sessions import StringSession
 
@@ -239,6 +239,10 @@ def _task_view(task):
         "finished_at": task.get("finished_at"),
         "total": task.get("total", 0),
         "current": task.get("current", 0),
+        "pause_reason": task.get("pause_reason"),
+        "paused_at": task.get("paused_at"),
+        "resume_min_id": task.get("resume_min_id", task.get("min_id", 0)),
+        "resume_max_id": task.get("resume_max_id", task.get("max_id", 0)),
     }
 
 
@@ -585,16 +589,27 @@ async def _task_worker():
                     task["reverse"], task["min_id"], task["limit"], task["is_bot"],
                     task.get("pair_id"), task.get("config"), task["id"],
                     task.get("source_title"), task.get("target_title"),
-                    task.get("force_sync", False)
+                    task.get("force_sync", False),
+                    max_id=task.get("resume_max_id", task.get("max_id", 0))
                 )
+                pause_requested = state.pop("_task_pause_requested", False)
                 task["status"] = (
-                    "partial" if state.pop("_task_partial", False) else "complete"
+                    "paused" if pause_requested
+                    else ("partial" if state.pop("_task_partial", False) else "complete")
                 )
+                if pause_requested:
+                    task["pause_reason"] = state.pop("_task_pause_reason", "A limit temporarily stopped this task")
+                    task["resume_min_id"] = state.pop("_task_resume_min_id", task.get("min_id", 0))
+                    task["resume_max_id"] = state.pop("_task_resume_max_id", task.get("max_id", 0))
             except Exception as exc:
                 task["status"] = "failed"
                 logger.exception("Queued task failed: %s", exc)
             finally:
-                task["finished_at"] = datetime.now().isoformat(timespec="seconds")
+                if task["status"] == "paused":
+                    task["paused_at"] = datetime.now().isoformat(timespec="seconds")
+                    task.pop("finished_at", None)
+                else:
+                    task["finished_at"] = datetime.now().isoformat(timespec="seconds")
                 task["stats"] = dict(state.get("stats", {}))
                 task["total"] = state.get("total_msgs", 0)
                 task["current"] = state.get("current_id", 0)
@@ -612,16 +627,62 @@ async def _task_worker():
                     status_icon = {"complete": "✅", "partial": "⚠️", "failed": "❌"}.get(
                         task["status"], "ℹ️"
                     )
-                    await _notify_owner(
+                    message = (
+                        f"⏸️ Task {task['id']} paused\n\n"
+                        f"Reason: {task.get('pause_reason', 'A temporary limit was reached')}\n"
+                        f"Progress: {task.get('current', 0)} processed\n\n"
+                        "Continue button dabakar isi task ko saved progress se aage chala sakte ho."
+                        if task["status"] == "paused" else
                         f"{status_icon} Task {task['id']} "
                         f"{task['status']} — {task.get('current', 0)} processed, "
                         f"{task.get('stats', {}).get('failed', 0)} failed"
                     )
+                    markup = (
+                        InlineKeyboardMarkup([[
+                            InlineKeyboardButton("▶️ Continue", callback_data=f"continue:{task['id']}")
+                        ]]) if task["status"] == "paused" else None
+                    )
+                    await _notify_owner(message, reply_markup=markup)
     finally:
         _task_worker_running = False
         state["running"] = bool(_task_queue)
         state.pop("active_task_id", None)
         save_state(state)
+
+
+def _resume_paused_task(task):
+    """Put a paused task back in the queue without creating a new task ID."""
+    if task.get("status") != "paused":
+        return False, "Task is not paused"
+    if any(item.get("id") == task["id"] for item in _task_queue):
+        return False, "Task is already queued"
+    pair = _pair_by_id(task.get("pair_id"))
+    source = (pair or {}).get("source") or task.get("source")
+    target = (pair or {}).get("target") or task.get("target")
+    internal = {
+        **task,
+        "source": source,
+        "target": target,
+        "source_title": (pair or {}).get("source_title", task.get("source", source)),
+        "target_title": (pair or {}).get("target_title", task.get("target", target)),
+        "reverse": task.get("mode") != "last",
+        "min_id": task.get("resume_min_id", task.get("min_id", 0)),
+        "max_id": task.get("resume_max_id", task.get("max_id", 0)),
+        "config": _pair_config(pair),
+        "progress_msg": WebEvent(),
+        "is_bot": False,
+        "status": "queued",
+    }
+    task.update({
+        "status": "queued",
+        "min_id": internal["min_id"],
+        "pause_reason": None,
+    })
+    _task_queue.append(internal)
+    save_state(state)
+    if _loop is not None and _loop.is_running():
+        asyncio.run_coroutine_threadsafe(_task_worker(), _loop)
+    return True, "Task queued to continue"
 
 
 def _queue_sync(source, target, reverse=True, min_id=0, limit=None,
@@ -1609,7 +1670,8 @@ TYPE_ICON = {
 
 async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
                     is_bot=False, pair_id="default", config=None, task_id=None,
-                    source_title=None, target_title=None, force_sync=False):
+                    source_title=None, target_title=None, force_sync=False,
+                    max_id=0):
     async def edit_msg(text, parse_mode=None):
         try:
             if is_bot:
@@ -1657,7 +1719,8 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
             source_entity,
             reverse=reverse,
             min_id=min_id,
-            limit=effective_limit
+            limit=effective_limit,
+            max_id=max_id or None
         ):
             state.setdefault("source_last_ids", {})[str(pair_id)] = message.id
             controls = state.setdefault("task_controls", {})
@@ -1732,11 +1795,15 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
                 else _daily_budget(pair_id, config, message)
             )
             if not budget_ok:
-                state["_task_partial"] = True
-                state["_task_stop_reason"] = "daily limit reached"
+                state["_task_pause_requested"] = True
+                state["_task_pause_reason"] = "Daily message/media limit reached"
+                if reverse:
+                    state["_task_resume_min_id"] = max(0, message.id - 1)
+                else:
+                    state["_task_resume_max_id"] = message.id + 1
                 save_state(state)
                 _log_live(
-                    f"🛑 Daily limit reached for pair {pair_id}: "
+                    f"⏸️ Daily limit reached for pair {pair_id}: "
                     f"{budget_bucket['messages']} messages / {budget_bucket['media_mb']:.1f} MB"
                 )
                 break
@@ -1933,8 +2000,6 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
             except FloodWaitError as e:
                 wait = e.seconds + 10
                 logger.warning(f"FloodWait {wait}s after msg_id={message.id}")
-                if state.get("notification_settings", {}).get("flood_wait", True):
-                    await _notify_owner(f"⚠️ FloodWait warning: waiting {wait}s after message {message.id}")
                 await edit_msg(
                     f"⏸️ *FloodWait!*\n\n"
                     f"Telegram ne slow karne kaha\n"
@@ -1942,7 +2007,15 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
                     f"Progress: {count}/{total_count}",
                     parse_mode="Markdown"
                 )
-                await asyncio.sleep(wait)
+                state["_task_pause_requested"] = True
+                state["_task_pause_reason"] = f"Telegram FloodWait limit ({wait}s suggested wait)"
+                if reverse:
+                    state["_task_resume_min_id"] = max(0, message.id - 1)
+                else:
+                    state["_task_resume_max_id"] = message.id + 1
+                state["running"] = False
+                save_state(state)
+                break
 
             except SlowModeWaitError as e:
                 wait = e.seconds + 5
@@ -1952,7 +2025,15 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
                     f"⏱ Wait: *{wait}s*",
                     parse_mode="Markdown"
                 )
-                await asyncio.sleep(wait)
+                state["_task_pause_requested"] = True
+                state["_task_pause_reason"] = f"Target channel slow mode ({wait}s suggested wait)"
+                if reverse:
+                    state["_task_resume_min_id"] = max(0, message.id - 1)
+                else:
+                    state["_task_resume_max_id"] = message.id + 1
+                state["running"] = False
+                save_state(state)
+                break
 
             except ChatWriteForbiddenError:
                 logger.error("ChatWriteForbiddenError — no write permission on target")
@@ -2032,10 +2113,17 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
         )
 
         was_partial = bool(state.get("_task_partial"))
-        completion_title = "⚠️ *Sync Stopped at Limit!*" if was_partial else "✅ *Sync Complete!*"
+        was_paused = bool(state.get("_task_pause_requested"))
+        completion_title = (
+            "⏸️ *Task Paused — Continue Later*"
+            if was_paused else
+            ("⚠️ *Sync Stopped at Limit!*" if was_partial else "✅ *Sync Complete!*")
+        )
         stop_note = (
-            "\nDaily message/media limit reached. Limit badhakar ya kal dobara refresh/sync karein.\n"
-            if completion_title.startswith("⚠️") else ""
+            "\nTemporary limit ki wajah se task pause hua hai. Dashboard ya Telegram ke Continue button se isi task ko aage chalao.\n"
+            if was_paused else
+            ("\nDaily message/media limit reached. Limit badhakar ya kal dobara refresh/sync karein.\n"
+             if completion_title.startswith("⚠️") else "")
         )
         await edit_msg(
             f"{completion_title}\n\n"
@@ -2339,10 +2427,12 @@ _bot_application = None
 _health_snapshot = {}
 
 
-async def _notify_owner(text):
+async def _notify_owner(text, reply_markup=None):
     if _bot_application:
         try:
-            await _bot_application.bot.send_message(chat_id=OWNER_ID, text=text)
+            await _bot_application.bot.send_message(
+                chat_id=OWNER_ID, text=text, reply_markup=reply_markup
+            )
         except Exception as exc:
             logger.warning("Owner alert failed: %s", exc)
 
@@ -2918,11 +3008,32 @@ def api_task_control(task_id):
                 _task_queue.remove(queued)
         task["status"] = "cancelled"
     else:
-        paused = bool((request.json or {}).get("paused"))
+        payload = request.json or {}
+        if payload.get("continue") is True:
+            ok, message = _resume_paused_task(task)
+            return jsonify({"ok": ok, "message": message, "task": _task_view(task)})
+        paused = bool(payload.get("paused"))
         state.setdefault("task_controls", {}).setdefault(task_id, {})["paused"] = paused
         task["status"] = "paused" if paused else ("running" if task_id == state.get("active_task_id") else "queued")
     save_state(state)
     return jsonify({"ok": True, "task": task})
+
+
+async def bot_continue_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or query.from_user.id != OWNER_ID:
+        return
+    await query.answer()
+    task_id = (query.data or "").split(":", 1)[-1]
+    task = next((item for item in state.get("tasks", []) if item.get("id") == task_id), None)
+    if not task:
+        await query.edit_message_text("❌ Task nahi mila.")
+        return
+    ok, message = _resume_paused_task(task)
+    if ok:
+        await query.edit_message_text(f"▶️ Task {task_id} continue ke liye queue ho gaya.")
+    else:
+        await query.answer(message, show_alert=True)
 
 
 @flask_app.route("/api/tasks/bulk", methods=["POST"])
@@ -3104,6 +3215,7 @@ async def main():
     app.add_handler(CommandHandler("autoforward", bot_autoforward))
     app.add_handler(CommandHandler("caption", bot_caption))
     app.add_handler(CommandHandler("setthumbnail", bot_setthumbnail))
+    app.add_handler(CallbackQueryHandler(bot_continue_callback, pattern=r"^continue:"))
 
     print("🤖 Telegram Bot started! Commands available via bot.")
     print("⚡ Both userbot + bot running...")

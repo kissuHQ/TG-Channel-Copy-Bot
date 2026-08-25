@@ -1,0 +1,1 @@
+- [Limit-induced task pausing](task-limit-pausing.md) — temporary Telegram/quota limits preserve progress and require explicit continuation.

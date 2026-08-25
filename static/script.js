@@ -152,15 +152,18 @@ function renderTasks(tasks) {
   box.innerHTML = tasks.slice(-20).reverse().map(task => {
     const statusClass = task.status === 'complete' ? 'done' :
                         task.status === 'failed' ? 'failed' :
+                        task.status === 'paused' ? 'paused' :
                         task.status === 'running' ? 'running' : 'queued';
     return `<div class="task-item">
       <input class="task-select" type="checkbox" value="${escapeHtml(task.id)}" aria-label="Select task ${escapeHtml(task.id)}"/>
       <div><strong>${escapeHtml(task.id)}</strong> <span class="task-status ${statusClass}">${escapeHtml(task.status)}</span></div>
       <div class="task-route">${escapeHtml(task.source || 'Source')} → ${escapeHtml(task.target || 'Target')}</div>
       <div class="task-mode">${escapeHtml(task.mode || 'sync')} · ${escapeHtml(task.priority || 'normal')} priority · sent ${task.stats?.text + task.stats?.photo + task.stats?.video + task.stats?.doc + task.stats?.other || 0} · failed ${task.stats?.failed || 0}</div>
+      ${task.status === 'paused' ? `<div class="task-pause-reason">⏸️ ${escapeHtml(task.pause_reason || 'Temporarily paused by a limit')}</div>` : ''}
       ${task.status === 'queued' ? `<button class="mini-btn" onclick="reorderTask('${escapeHtml(task.id)}','up')">↑</button><button class="mini-btn" onclick="reorderTask('${escapeHtml(task.id)}','down')">↓</button>` : ''}
       ${task.status === 'queued' || task.status === 'running' ? `<button class="mini-danger" onclick="controlTask('${escapeHtml(task.id)}','cancel')">Cancel</button>` : ''}
-      ${task.status === 'running' || task.status === 'paused' ? `<button class="mini-btn" onclick="controlTask('${escapeHtml(task.id)}','${task.status === 'paused' ? 'resume' : 'pause'}')">${task.status === 'paused' ? 'Resume' : 'Pause'}</button>` : ''}
+      ${task.status === 'paused' ? `<button class="mini-btn btn-continue" onclick="controlTask('${escapeHtml(task.id)}','continue')">▶ Continue</button>` : ''}
+      ${task.status === 'running' ? `<button class="mini-btn" onclick="controlTask('${escapeHtml(task.id)}','pause')">Pause</button>` : ''}
     </div>`;
   }).join('');
 }
@@ -169,8 +172,10 @@ async function controlTask(id, action) {
   const url = '/api/tasks/' + encodeURIComponent(id);
   const data = action === 'cancel'
     ? await fetch(url, {method:'DELETE'}).then(r => r.json())
-    : await fetch(url, {method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({paused: action === 'pause'})}).then(r => r.json());
-  toast(data.ok ? '✅ Task updated' : '❌ ' + data.error, !data.ok);
+    : await fetch(url, {method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify(
+        action === 'continue' ? {continue: true} : {paused: action === 'pause'}
+      )}).then(r => r.json());
+  toast(data.ok ? (action === 'continue' ? '▶ Task continue ke liye queue ho gaya' : '✅ Task updated') : '❌ ' + (data.error || data.message), !data.ok);
 }
 
 function escapeHtml(value) {
