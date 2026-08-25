@@ -43,7 +43,18 @@
       "caption_suffix": "",
       "remove_links": false,
       "remove_source_name": false,
-      "rate_delay": 3
+      "rate_delay": 3,
+      "caption_enabled": false,
+      "caption_template": "",
+      "caption_types": [
+        "text",
+        "photo",
+        "video",
+        "doc",
+        "other"
+      ],
+      "caption_parse_mode": "md",
+      "thumbnail_enabled": false
     }
   ],
   "dedupe": {},

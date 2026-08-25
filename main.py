@@ -415,7 +415,10 @@ async def send_album(target, messages, on_progress=None, config=None,
     needs_rewrite = any([
         config["caption_prefix"], config["caption_suffix"],
         config["remove_links"], config["remove_source_name"],
-        config.get("caption_enabled"), config.get("thumbnail_enabled"),
+        any(config.get("caption_enabled") and get_msg_type(message) in config.get("caption_types", [])
+            for message in messages),
+        any(config.get("thumbnail_enabled") and get_msg_type(message) == "video"
+            for message in messages),
     ])
     restricted = bool(
         getattr(source_entity, "noforwards", False)
@@ -1936,10 +1939,12 @@ async def send_message(target, message, on_progress=None, config=None, source_ti
     # Restricted or otherwise non-copyable messages fall back to the existing
     # disk-based path below.
     config = config or _pair_config(None)
+    msg_type = get_msg_type(message)
     needs_rewrite = any([
         config["caption_prefix"], config["caption_suffix"],
         config["remove_links"], config["remove_source_name"],
-        config.get("caption_enabled"), config.get("thumbnail_enabled"),
+        config.get("caption_enabled") and msg_type in config.get("caption_types", []),
+        config.get("thumbnail_enabled") and msg_type == "video",
     ])
     # Telegram marks protected channels with noforwards. Do not probe a
     # protected message with a copy request: download and re-upload instead.
@@ -2519,10 +2524,13 @@ def api_delete_pair(pair_id):
                 pair[key] = payload[key]
         save_state(state)
         return jsonify({"ok": True, "pair": pair})
+    pair = _pair_by_id(pair_id)
     before = len(state.get("pairs", []))
     state["pairs"] = [p for p in state.get("pairs", []) if p.get("id") != pair_id]
     if len(state["pairs"]) == before:
         return jsonify({"ok": False, "error": "Pair not found"})
+    if pair and pair.get("thumbnail_path"):
+        Path(pair["thumbnail_path"]).unlink(missing_ok=True)
     save_state(state)
     return jsonify({"ok": True})
 
@@ -2549,6 +2557,15 @@ def api_pair_thumbnail(pair_id):
     upload.stream.seek(0, os.SEEK_END)
     size = upload.stream.tell()
     upload.stream.seek(0)
+    header = upload.stream.read(16)
+    upload.stream.seek(0)
+    valid_image = (
+        header.startswith(b"\xff\xd8\xff")
+        or header.startswith(b"\x89PNG\r\n\x1a\n")
+        or header[:4] == b"RIFF" and header[8:12] == b"WEBP"
+    )
+    if not valid_image:
+        return jsonify({"ok": False, "error": "Unsupported or invalid image file"}), 400
     if size > 20 * 1024 * 1024:
         return jsonify({"ok": False, "error": "Thumbnail must be 20 MB or smaller"}), 400
     suffix = Path(upload.filename).suffix.lower() or ".jpg"
