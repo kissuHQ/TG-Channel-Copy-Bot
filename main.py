@@ -260,8 +260,11 @@ def _pair_config(pair):
         "remove_source_name": bool(pair.get("remove_source_name")),
         "rate_profile": profile if profile in RATE_PROFILES else "balanced",
         "rate_delay": max(MIN_RATE_DELAY, min(float(pair.get("rate_delay", profile_delay)), 300)),
-        "max_messages": max(1, min(int(pair.get("max_messages", MAX_TASK_MESSAGES)), MAX_TASK_MESSAGES)),
-        "daily_message_limit": max(1, min(int(pair.get("daily_message_limit", DEFAULT_DAILY_MESSAGES)), MAX_TASK_MESSAGES)),
+        "max_messages": MAX_TASK_MESSAGES,
+        "daily_message_limit": max(
+            MAX_TASK_MESSAGES,
+            min(int(pair.get("daily_message_limit", DEFAULT_DAILY_MESSAGES)), MAX_TASK_MESSAGES),
+        ),
         "daily_media_mb": max(1, min(int(pair.get("daily_media_mb", DEFAULT_DAILY_MEDIA_MB)), 102400)),
         "auto_forward": bool(pair.get("auto_forward", False)),
         "dedupe_mode": pair.get("dedupe_mode", "strong"),
@@ -581,7 +584,8 @@ async def _task_worker():
                     task["progress_msg"], task["source"], task["target"],
                     task["reverse"], task["min_id"], task["limit"], task["is_bot"],
                     task.get("pair_id"), task.get("config"), task["id"],
-                    task.get("source_title"), task.get("target_title")
+                    task.get("source_title"), task.get("target_title"),
+                    task.get("force_sync", False)
                 )
                 task["status"] = (
                     "partial" if state.pop("_task_partial", False) else "complete"
@@ -622,7 +626,7 @@ async def _task_worker():
 
 def _queue_sync(source, target, reverse=True, min_id=0, limit=None,
                 progress_msg=None, is_bot=False, mode="full", pair_id=None,
-                config=None, priority="normal"):
+                config=None, priority="normal", force_sync=False):
     pair = _pair_by_id(pair_id)
     task = {
         "id": uuid.uuid4().hex[:8],
@@ -639,6 +643,7 @@ def _queue_sync(source, target, reverse=True, min_id=0, limit=None,
         "config": config or _pair_config(_pair_by_id(pair_id)),
         "progress_msg": progress_msg or WebEvent(),
         "is_bot": is_bot,
+        "force_sync": force_sync,
         "status": "queued",
         "created_at": datetime.now().isoformat(timespec="seconds"),
     }
@@ -1170,6 +1175,7 @@ async def bot_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/settarget (msg forward karke) — Private channel target set\n"
         "/info — Current config dekho\n"
         "/sync — Full sync start karo\n"
+        "/force_sync — Full sync, daily limits ke bina\n"
         "/syncfrom `<id>` — Message ID se sync karo\n"
         "/synclast `<n>` — Last N messages sync karo\n"
         "/tasks — Queue ke tasks dekho\n"
@@ -1451,6 +1457,17 @@ async def bot_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("⏳ Full sync shuru ho rahi hai...")
     asyncio.create_task(start_sync_bot(msg, reverse=True, min_id=0))
 
+async def bot_force_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not bot_is_owner(update):
+        return
+    msg = await update.message.reply_text(
+        "🚀 Force sync shuru ho rahi hai (daily limits bypass)..."
+    )
+    asyncio.create_task(
+        start_sync_bot(msg, reverse=True, min_id=0, force_sync=True)
+    )
+
+
 async def bot_syncfrom(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not bot_is_owner(update):
         return
@@ -1544,13 +1561,15 @@ async def start_sync_userbot(event, reverse=True, min_id=0, limit=None):
     )
 
 
-async def start_sync_bot(progress_msg, reverse=True, min_id=0, limit=None):
+async def start_sync_bot(progress_msg, reverse=True, min_id=0, limit=None,
+                         force_sync=False):
     if not state.get("source") or not state.get("target"):
         await progress_msg.edit_text("❌ Pehle /setsource aur /settarget karo!")
         return
     task = _queue_sync(
         state["source"], state["target"], reverse, min_id, limit,
-        progress_msg, True, "full" if not limit and not min_id else "range"
+        progress_msg, True, "force" if force_sync else ("full" if not limit and not min_id else "range"),
+        force_sync=force_sync
     )
     await progress_msg.edit_text(
         f"⏳ Task {task['id']} queued\n"
@@ -1590,7 +1609,7 @@ TYPE_ICON = {
 
 async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
                     is_bot=False, pair_id="default", config=None, task_id=None,
-                    source_title=None, target_title=None):
+                    source_title=None, target_title=None, force_sync=False):
     async def edit_msg(text, parse_mode=None):
         try:
             if is_bot:
@@ -1672,7 +1691,10 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
                         item for item in album
                         if not _is_duplicate(pair_id, item)
                     ]
-                    if album and all(_daily_budget(pair_id, config, item)[0] for item in album):
+                    if album and (
+                        force_sync
+                        or all(_daily_budget(pair_id, config, item)[0] for item in album)
+                    ):
                         sent_album = await send_album(
                             target_entity, album, config=config,
                             source_title=src_title, source_entity=source_entity
@@ -1683,7 +1705,8 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
                             _remember_mapping(pair_id, item.id, sent_item)
                             _record_dedupe(pair_id, item)
                             stats[get_msg_type(item)] = stats.get(get_msg_type(item), 0) + 1
-                            _daily_budget(pair_id, config, item, commit=True)
+                            if not force_sync:
+                                _daily_budget(pair_id, config, item, commit=True)
                         count += len(album)
                         state["current_id"] = count
                         state["stats"] = stats
@@ -1703,7 +1726,11 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
                 stats["duplicates"] = stats.get("duplicates", 0) + 1
                 _log_live(f"⏭️ Duplicate skipped ID={message.id}")
                 continue
-            budget_ok, budget_bucket = _daily_budget(pair_id, config, message)
+            budget_ok, budget_bucket = (
+                (True, None)
+                if force_sync
+                else _daily_budget(pair_id, config, message)
+            )
             if not budget_ok:
                 state["_task_partial"] = True
                 state["_task_stop_reason"] = "daily limit reached"
@@ -2431,8 +2458,8 @@ async def _create_pair(payload):
         "remove_source_name": bool(payload.get("remove_source_name")),
         "rate_profile": str(payload.get("rate_profile", "balanced")).lower(),
         "rate_delay": max(MIN_RATE_DELAY, min(float(payload.get("rate_delay", MSG_DELAY)), 300)),
-        "max_messages": max(1, min(int(payload.get("max_messages", MAX_TASK_MESSAGES)), MAX_TASK_MESSAGES)),
-        "daily_message_limit": max(1, min(int(payload.get("daily_message_limit", DEFAULT_DAILY_MESSAGES)), MAX_TASK_MESSAGES)),
+        "max_messages": MAX_TASK_MESSAGES,
+        "daily_message_limit": MAX_TASK_MESSAGES,
         "daily_media_mb": max(1, min(int(payload.get("daily_media_mb", DEFAULT_DAILY_MEDIA_MB)), 102400)),
         "auto_forward": bool(payload.get("auto_forward", True)),
         "dedupe_mode": str(payload.get("dedupe_mode", "strong")),
@@ -3069,6 +3096,7 @@ async def main():
     app.add_handler(CommandHandler("stop", bot_stop))
     app.add_handler(CommandHandler("reset", bot_reset))
     app.add_handler(CommandHandler("sync", bot_sync))
+    app.add_handler(CommandHandler("force_sync", bot_force_sync))
     app.add_handler(CommandHandler("syncfrom", bot_syncfrom))
     app.add_handler(CommandHandler("synclast", bot_synclast))
     app.add_handler(CommandHandler("refresh", bot_refresh))

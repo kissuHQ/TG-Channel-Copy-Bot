@@ -239,7 +239,7 @@ async function addPair() {
     rate_profile: document.getElementById('pair-profile').value,
     rate_delay: parseInt(document.getElementById('pair-rate').value || '3'),
     max_messages: parseInt(document.getElementById('pair-max').value || '5000'),
-    daily_message_limit: parseInt(document.getElementById('pair-daily-msg').value || '1000'),
+     daily_message_limit: parseInt(document.getElementById('pair-daily-msg').value || '5000'),
     daily_media_mb: parseInt(document.getElementById('pair-daily-mb').value || '2048'),
     auto_forward: document.getElementById('pair-auto').checked,
     allowed_types: [...document.querySelectorAll('.pair-type:checked')].map(x => x.value)
@@ -279,7 +279,7 @@ function editPair(id) {
   document.getElementById('pair-profile').value = pair.rate_profile || 'balanced';
   document.getElementById('pair-rate').value = pair.rate_delay || 3;
   document.getElementById('pair-max').value = pair.max_messages || 5000;
-  document.getElementById('pair-daily-msg').value = pair.daily_message_limit || 1000;
+  document.getElementById('pair-daily-msg').value = pair.daily_message_limit || 5000;
   document.getElementById('pair-daily-mb').value = pair.daily_media_mb || 2048;
   document.getElementById('pair-auto').checked = !!pair.auto_forward;
   document.getElementById('pair-links').checked = !!pair.remove_links;
