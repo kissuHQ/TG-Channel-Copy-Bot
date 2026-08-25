@@ -54,7 +54,8 @@
         "other"
       ],
       "caption_parse_mode": "md",
-      "thumbnail_enabled": false
+      "thumbnail_enabled": false,
+      "auto_forward": true
     }
   ],
   "dedupe": {},
