@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}Tasks · Archive Bot{% endblock %}
+{% block crumb %}Tasks{% endblock %}
+{% block content %}
+<section class="page-heading"><div><p class="eyebrow">Operations</p><h1>Tasks</h1><p class="lede">Every sync has its own status, progress, and continuation point.</p></div><a class="button primary" href="#new-task">New task</a></section>
+<section class="surface task-create" id="new-task">
+  <div class="section-header"><div><p class="eyebrow">Start a sync</p><h2>Create a task</h2></div><span class="muted">Choose a route, then configure the run.</span></div>
+  <div class="form-grid three">
+    <label>Channel pair<select id="task-pair"></select></label>
+    <label>Sync mode<select id="task-mode"><option value="full">Full sync</option><option value="last">Last N messages</option><option value="from_id">From message ID</option></select></label>
+    <label>Priority<select id="task-priority"><option value="normal">Normal</option><option value="high">High</option><option value="low">Low</option></select></label>
+  </div>
+  <div class="form-grid two">
+    <label id="task-limit-wrap">Amount or message ID<input id="task-limit" type="number" placeholder="Optional"></label>
+    <div class="form-actions"><button class="button primary" onclick="createTaskFromPage()">Add to queue</button><button class="button secondary" onclick="runDryPage()">Preview run</button></div>
+  </div>
+  <div id="task-dry-run" class="notice hidden"></div>
+</section>
+<section class="surface">
+  <div class="section-header"><div><p class="eyebrow">Queue & history</p><h2>All tasks</h2></div><div class="list-tools"><select id="task-filter" onchange="renderTaskPage()"><option value="all">All statuses</option><option value="running">Running</option><option value="paused">Paused</option><option value="queued">Queued</option><option value="complete">Complete</option><option value="failed">Failed</option></select><button class="button small secondary" onclick="bulkTaskPage('pause')">Pause selected</button><button class="button small secondary" onclick="bulkTaskPage('resume')">Resume selected</button></div></div>
+  <div id="page-task-list" class="task-card-list"><div class="empty-state">Loading tasks…</div></div>
+</section>
+{% endblock %}
+{% block scripts %}<script>window.PAGE = 'tasks';</script>{% endblock %}

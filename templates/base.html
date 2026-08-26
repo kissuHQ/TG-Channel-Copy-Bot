@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Archive Bot{% endblock %}</title>
+  <meta name="description" content="A clear control center for Telegram archive syncs.">
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/multipage.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <a class="brand" href="/dashboard">
+        <span class="brand-mark">AB</span>
+        <span><strong>Archive Bot</strong><small>Telegram copier</small></span>
+      </a>
+      <nav class="nav">
+        <div class="nav-label">Workspace</div>
+        <a class="nav-link {% if active_page == 'dashboard' %}active{% endif %}" href="/dashboard"><span>Overview</span><small>Live health</small></a>
+        <a class="nav-link {% if active_page == 'tasks' %}active{% endif %}" href="/tasks"><span>Tasks</span><small>Runs & progress</small></a>
+        <a class="nav-link {% if active_page == 'pairs' %}active{% endif %}" href="/pairs"><span>Channel pairs</span><small>Sources & targets</small></a>
+        <div class="nav-label nav-label-spaced">System</div>
+        <a class="nav-link {% if active_page == 'settings' %}active{% endif %}" href="/settings"><span>Global settings</span><small>Notifications & defaults</small></a>
+      </nav>
+      <div class="sidebar-footer">
+        <div class="connection-card"><span class="status-dot" id="side-status-dot"></span><div><strong id="side-status">Checking connection</strong><small>Telegram session</small></div></div>
+        <a href="/settings" class="help-link">Need to change behavior? <span>Open settings →</span></a>
+      </div>
+    </aside>
+    <main class="main-content">
+      <header class="topbar">
+        <div class="mobile-brand"><span class="brand-mark">AB</span><strong>Archive Bot</strong></div>
+        <div class="breadcrumbs"><span>Archive Bot</span><span>/</span><strong>{% block crumb %}Overview{% endblock %}</strong></div>
+        <div class="topbar-actions"><span class="live-indicator"><i></i><span id="top-status">Connecting</span></span><a class="icon-button" href="/settings" aria-label="Open settings">Settings</a></div>
+      </header>
+      <div id="toast" class="app-toast" role="status"></div>
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+  {% block scripts %}{% endblock %}
+  <script src="/static/multipage.js"></script>
+</body>
+</html>

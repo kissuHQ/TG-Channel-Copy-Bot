@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}Task {{ task_id }} · Archive Bot{% endblock %}
+{% block crumb %}<a href="/tasks">Tasks</a> / {{ task_id }}{% endblock %}
+{% block content %}
+<section class="page-heading"><div><a class="back-link" href="/tasks">← Back to tasks</a><p class="eyebrow">Task details</p><h1 id="detail-title">Task {{ task_id }}</h1><p class="lede" id="detail-route">Loading task…</p></div><div class="heading-actions" id="detail-actions"></div></section>
+<div class="detail-grid">
+  <section class="surface panel-large">
+    <div class="section-header"><div><p class="eyebrow">Run state</p><h2 id="detail-status-title">Loading</h2></div><span id="detail-status" class="status-pill neutral">—</span></div>
+    <div class="progress-summary"><strong id="detail-progress">0 / 0</strong><span id="detail-updated">—</span></div><div class="progress-track"><span id="detail-progress-bar"></span></div>
+    <div class="detail-stats"><div><small>Mode</small><strong id="detail-mode">—</strong></div><div><small>Priority</small><strong id="detail-priority">—</strong></div><div><small>Failed</small><strong id="detail-failed">—</strong></div><div><small>Created</small><strong id="detail-created">—</strong></div></div>
+    <div id="detail-reason" class="notice warning hidden"></div>
+  </section>
+  <section class="surface">
+    <div class="section-header"><div><p class="eyebrow">Task profile</p><h2>Transfer settings</h2></div><span class="muted">Applies to this task’s channel pair</span></div>
+    <div id="detail-form" class="profile-form"><div class="empty-state">Loading settings…</div></div>
+  </section>
+</div>
+{% endblock %}
+{% block scripts %}<script>window.PAGE = 'task-detail'; window.TASK_ID = {{ task_id|tojson }};</script>{% endblock %}

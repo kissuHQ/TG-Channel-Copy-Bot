@@ -243,6 +243,7 @@ def _task_view(task):
         "paused_at": task.get("paused_at"),
         "resume_min_id": task.get("resume_min_id", task.get("min_id", 0)),
         "resume_max_id": task.get("resume_max_id", task.get("max_id", 0)),
+        "task_settings": task.get("task_settings", task.get("config", {})),
     }
 
 
@@ -587,7 +588,7 @@ async def _task_worker():
                 await _run_sync(
                     task["progress_msg"], task["source"], task["target"],
                     task["reverse"], task["min_id"], task["limit"], task["is_bot"],
-                    task.get("pair_id"), task.get("config"), task["id"],
+                    task.get("pair_id"), task.get("task_settings", task.get("config")), task["id"],
                     task.get("source_title"), task.get("target_title"),
                     task.get("force_sync", False),
                     max_id=task.get("resume_max_id", task.get("max_id", 0))
@@ -668,7 +669,8 @@ def _resume_paused_task(task):
         "reverse": task.get("mode") != "last",
         "min_id": task.get("resume_min_id", task.get("min_id", 0)),
         "max_id": task.get("resume_max_id", task.get("max_id", 0)),
-        "config": _pair_config(pair),
+        "config": task.get("task_settings") or _pair_config(pair),
+        "task_settings": task.get("task_settings") or _pair_config(pair),
         "progress_msg": WebEvent(),
         "is_bot": False,
         "status": "queued",
@@ -2609,7 +2611,32 @@ async def _dry_run_many(pairs, mode, value):
 
 @flask_app.route("/")
 def index():
-    return render_template("index.html")
+    return render_template("dashboard.html", active_page="dashboard")
+
+
+@flask_app.route("/dashboard")
+def dashboard_page():
+    return render_template("dashboard.html", active_page="dashboard")
+
+
+@flask_app.route("/tasks")
+def tasks_page():
+    return render_template("tasks.html", active_page="tasks")
+
+
+@flask_app.route("/tasks/<task_id>")
+def task_detail_page(task_id):
+    return render_template("task_detail.html", active_page="tasks", task_id=task_id)
+
+
+@flask_app.route("/pairs")
+def pairs_page():
+    return render_template("pairs.html", active_page="pairs")
+
+
+@flask_app.route("/settings")
+def settings_page():
+    return render_template("settings.html", active_page="settings")
 
 
 @flask_app.route("/favicon.ico")
@@ -2676,6 +2703,28 @@ def api_status():
 def api_bootstrap():
     """One initial dashboard snapshot; later changes arrive over SSE."""
     return jsonify(_dashboard_payload())
+
+
+@flask_app.route("/api/settings", methods=["GET", "PATCH"])
+def api_settings():
+    settings = state.setdefault("notification_settings", {
+        "task_complete": True, "task_failed": True, "flood_wait": True,
+    })
+    if request.method == "PATCH":
+        payload = request.json or {}
+        for key in ("task_complete", "task_failed", "flood_wait"):
+            if key in payload:
+                settings[key] = bool(payload[key])
+        if "auto_forward" in payload:
+            state["auto_forward"] = bool(payload["auto_forward"])
+        save_state(state)
+    return jsonify({
+        "ok": True,
+        "notification_settings": settings,
+        "auto_forward": bool(state.get("auto_forward")),
+        "storage_limit_mb": round(TEMP_STORAGE_LIMIT_BYTES / 1048576),
+        "max_task_messages": MAX_TASK_MESSAGES,
+    })
 
 
 @flask_app.route("/api/events")
@@ -2763,7 +2812,14 @@ def api_delete_pair(pair_id):
                     "protected_behavior", "caption_enabled", "caption_template",
                     "caption_types", "caption_parse_mode", "thumbnail_enabled"):
             if key in payload:
-                pair[key] = payload[key]
+                if key in {"include_keywords", "exclude_keywords"}:
+                    value = payload[key]
+                    pair[key] = (
+                        [item.strip() for item in str(value).split(",") if item.strip()]
+                        if isinstance(value, str) else value
+                    )
+                else:
+                    pair[key] = payload[key]
         save_state(state)
         return jsonify({"ok": True, "pair": pair})
     pair = _pair_by_id(pair_id)
@@ -2836,6 +2892,54 @@ def api_pair_dedupe(pair_id):
     save_state(state)
     _log_live(f"🔁 Copy again enabled for pair {pair_id}; cleared {removed} identities")
     return jsonify({"ok": True, "removed": removed})
+
+
+@flask_app.route("/api/tasks/<task_id>/thumbnail", methods=["POST", "DELETE"])
+def api_task_thumbnail(task_id):
+    task = next((item for item in state.get("tasks", []) if item.get("id") == task_id), None)
+    if not task:
+        return jsonify({"ok": False, "error": "Task not found"}), 404
+    settings = dict(task.get("task_settings") or _pair_config(_pair_by_id(task.get("pair_id"))))
+    old = settings.get("thumbnail_path")
+    if request.method == "DELETE":
+        if old:
+            Path(old).unlink(missing_ok=True)
+        settings["thumbnail_path"] = ""
+        settings["thumbnail_enabled"] = False
+    else:
+        upload = request.files.get("thumbnail")
+        if not upload or not upload.filename:
+            return jsonify({"ok": False, "error": "Upload a thumbnail image"}), 400
+        if not (upload.mimetype or "").startswith("image/"):
+            return jsonify({"ok": False, "error": "Thumbnail must be an image"}), 400
+        upload.stream.seek(0, os.SEEK_END)
+        size = upload.stream.tell()
+        upload.stream.seek(0)
+        header = upload.stream.read(16)
+        upload.stream.seek(0)
+        valid_image = (
+            header.startswith(b"\xff\xd8\xff")
+            or header.startswith(b"\x89PNG\r\n\x1a\n")
+            or (header[:4] == b"RIFF" and header[8:12] == b"WEBP")
+        )
+        if not valid_image:
+            return jsonify({"ok": False, "error": "Unsupported or invalid image file"}), 400
+        if size > 20 * 1024 * 1024:
+            return jsonify({"ok": False, "error": "Thumbnail must be 20 MB or smaller"}), 400
+        THUMBNAIL_DIR.mkdir(parents=True, exist_ok=True)
+        path = THUMBNAIL_DIR / f"task_{task_id}{Path(upload.filename).suffix.lower() or '.jpg'}"
+        upload.save(path)
+        if old and old != str(path):
+            Path(old).unlink(missing_ok=True)
+        settings["thumbnail_path"] = str(path)
+        settings["thumbnail_enabled"] = True
+    task["task_settings"] = settings
+    for queued in _task_queue:
+        if queued.get("id") == task_id:
+            queued["task_settings"] = settings
+            queued["config"] = settings
+    save_state(state)
+    return jsonify({"ok": True, "enabled": settings["thumbnail_enabled"]})
 
 
 @flask_app.route("/api/storage/cleanup", methods=["POST"])
@@ -3012,6 +3116,28 @@ def api_task_control(task_id):
         if payload.get("continue") is True:
             ok, message = _resume_paused_task(task)
             return jsonify({"ok": ok, "message": message, "task": _task_view(task)})
+        if isinstance(payload.get("settings"), dict):
+            settings = dict(task.get("task_settings") or _pair_config(_pair_by_id(task.get("pair_id"))))
+            editable = {
+                "include_keywords", "exclude_keywords", "caption_prefix", "caption_suffix",
+                "remove_links", "remove_source_name", "caption_enabled", "caption_template",
+                "thumbnail_enabled", "rate_delay", "max_messages", "daily_media_mb",
+                "protected_behavior", "schedule_start", "schedule_end", "quiet_start",
+                "quiet_end", "max_posts_per_hour", "caption_parse_mode",
+            }
+            for key, value in payload["settings"].items():
+                if key not in editable:
+                    continue
+                if key in {"include_keywords", "exclude_keywords"} and isinstance(value, str):
+                    value = [item.strip() for item in value.split(",") if item.strip()]
+                settings[key] = value
+            task["task_settings"] = settings
+            for queued in _task_queue:
+                if queued.get("id") == task_id:
+                    queued["task_settings"] = settings
+                    queued["config"] = settings
+            save_state(state)
+            return jsonify({"ok": True, "task": _task_view(task)})
         paused = bool(payload.get("paused"))
         state.setdefault("task_controls", {}).setdefault(task_id, {})["paused"] = paused
         task["status"] = "paused" if paused else ("running" if task_id == state.get("active_task_id") else "queued")
