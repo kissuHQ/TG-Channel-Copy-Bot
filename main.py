@@ -104,6 +104,8 @@ LOG_FILE     = "sync.log"
 
 SESSION_FILE = "archive_session"
 STATE_FILE   = "sync_state.json"
+STATE_WRITE_LOCK = threading.Lock()
+TELEGRAM_STARTING = True
 
 # ─── LOGGER SETUP ─────────────────────────────────────
 logger = logging.getLogger("SyncBot")
@@ -172,8 +174,13 @@ def load_state():
     return {}
 
 def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+    # Flask, the bot and Telethon handlers can persist at the same time.
+    # Atomic replacement keeps the JSON state valid after a restart.
+    with STATE_WRITE_LOCK:
+        tmp_path = f"{STATE_FILE}.tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(state, f, indent=2)
+        os.replace(tmp_path, STATE_FILE)
     _dashboard_changed()
 
 state = load_state()
@@ -1082,15 +1089,52 @@ async def cmd_status_userbot(event):
     )
 
 
+def _active_runtime_task():
+    active_id = state.get("active_task_id")
+    if active_id is not None:
+        return next((task for task in state.get("tasks", [])
+                     if task.get("id") == active_id), None)
+    return next((task for task in state.get("tasks", [])
+                 if task.get("status") == "running"), None)
+
+
+def _set_active_pause(paused):
+    task = _active_runtime_task()
+    if not task:
+        return False
+    task_id = str(task["id"])
+    state.setdefault("task_controls", {}).setdefault(
+        task_id, {"paused": False, "cancelled": False}
+    )["paused"] = paused
+    task["status"] = "paused" if paused else "running"
+    state["paused"] = paused
+    save_state(state)
+    return True
+
+
+def _stop_all_tasks():
+    """Stop the active task and clear queued work consistently."""
+    for task in state.get("tasks", []):
+        if task.get("status") in {"queued", "running", "paused"}:
+            task["status"] = "cancelled"
+        state.setdefault("task_controls", {}).setdefault(
+            str(task.get("id")), {}
+        ).update({"cancelled": True, "paused": False})
+    _task_queue.clear()
+    state["running"] = False
+    state["paused"] = False
+    state.pop("active_task_id", None)
+    save_state(state)
+
+
 @client.on(events.NewMessage(outgoing=True, pattern=r"^\.pause$"))
 async def cmd_pause(event):
     if not is_owner(event.sender_id):
         return
-    if not state.get("running"):
+    if not _active_runtime_task():
         await event.edit("❌ Koi sync chal nahi raha")
         return
-    state["paused"] = True
-    save_state(state)
+    _set_active_pause(True)
     await event.edit("⏸️ Sync paused. `.resume` se resume karo")
 
 
@@ -1098,11 +1142,11 @@ async def cmd_pause(event):
 async def cmd_resume(event):
     if not is_owner(event.sender_id):
         return
-    if not state.get("paused"):
+    task = _active_runtime_task()
+    if not task or not state.get("paused"):
         await event.edit("❌ Paused nahi hai")
         return
-    state["paused"] = False
-    save_state(state)
+    _set_active_pause(False)
     await event.edit("▶️ Sync resumed!")
 
 
@@ -1110,9 +1154,7 @@ async def cmd_resume(event):
 async def cmd_stop(event):
     if not is_owner(event.sender_id):
         return
-    state["running"] = False
-    state["paused"] = False
-    save_state(state)
+    _stop_all_tasks()
     await event.edit("🛑 Sync stopped.")
 
 
@@ -1120,10 +1162,19 @@ async def cmd_stop(event):
 async def cmd_reset(event):
     if not is_owner(event.sender_id):
         return
+    _stop_all_tasks()
     state.clear()
+    state.update({
+        "pairs": [],
+        "tasks": [],
+        "task_controls": {},
+        "auto_forward": False,
+        "auto_stats": {"sent": 0, "failed": 0},
+        "dedupe": {},
+        "message_map": {},
+        "oversized_messages": [],
+    })
     save_state(state)
-    if Path(STATE_FILE).exists():
-        os.remove(STATE_FILE)
     await event.edit("🔄 Config reset!")
 
 
@@ -1480,38 +1531,43 @@ async def bot_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def bot_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not bot_is_owner(update):
         return
-    if not state.get("running"):
+    if not _active_runtime_task():
         await update.message.reply_text("❌ Koi sync chal nahi raha")
         return
-    state["paused"] = True
-    save_state(state)
+    _set_active_pause(True)
     await update.message.reply_text("⏸️ Sync paused! /resume se resume karo.")
 
 async def bot_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not bot_is_owner(update):
         return
-    if not state.get("paused"):
+    if not _active_runtime_task() or not state.get("paused"):
         await update.message.reply_text("❌ Sync paused nahi hai")
         return
-    state["paused"] = False
-    save_state(state)
+    _set_active_pause(False)
     await update.message.reply_text("▶️ Sync resumed!")
 
 async def bot_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not bot_is_owner(update):
         return
-    state["running"] = False
-    state["paused"] = False
-    save_state(state)
+    _stop_all_tasks()
     await update.message.reply_text("🛑 Sync stopped.")
 
 async def bot_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not bot_is_owner(update):
         return
+    _stop_all_tasks()
     state.clear()
+    state.update({
+        "pairs": [],
+        "tasks": [],
+        "task_controls": {},
+        "auto_forward": False,
+        "auto_stats": {"sent": 0, "failed": 0},
+        "dedupe": {},
+        "message_map": {},
+        "oversized_messages": [],
+    })
     save_state(state)
-    if Path(STATE_FILE).exists():
-        os.remove(STATE_FILE)
     await update.message.reply_text("🔄 Config reset kar diya!")
 
 async def bot_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
