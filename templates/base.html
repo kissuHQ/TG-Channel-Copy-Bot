@@ -10,12 +10,12 @@
 </head>
 <body>
   <div class="app-shell">
-    <aside class="sidebar">
+    <aside class="sidebar" id="app-sidebar">
       <a class="brand" href="/dashboard">
         <span class="brand-mark">AB</span>
         <span><strong>Archive Bot</strong><small>Telegram copier</small></span>
       </a>
-      <nav class="nav">
+      <nav class="nav" id="app-sidebar-nav">
         <div class="nav-label">Workspace</div>
         <a class="nav-link {% if active_page == 'dashboard' %}active{% endif %}" href="/dashboard"><span>Overview</span><small>Live health</small></a>
         <a class="nav-link {% if active_page == 'tasks' %}active{% endif %}" href="/tasks"><span>Tasks</span><small>Runs & progress</small></a>
@@ -30,10 +30,17 @@
     </aside>
     <main class="main-content">
       <header class="topbar">
-        <div class="mobile-brand"><span class="brand-mark">AB</span><strong>Archive Bot</strong></div>
+        <div class="topbar-leading">
+          <button class="menu-toggle" id="menu-toggle" type="button" aria-controls="app-sidebar" aria-expanded="false">
+            <span class="menu-icon" aria-hidden="true"><i></i><i></i><i></i></span>
+            <span>Menu</span>
+          </button>
+          <div class="mobile-brand"><span class="brand-mark">AB</span><strong>Archive Bot</strong></div>
+        </div>
         <div class="breadcrumbs"><span>Archive Bot</span><span>/</span><strong>{% block crumb %}Overview{% endblock %}</strong></div>
         <div class="topbar-actions"><span class="live-indicator"><i></i><span id="top-status">Connecting</span></span><a class="icon-button" href="/settings" aria-label="Open settings">Settings</a></div>
       </header>
+      <button class="mobile-nav-backdrop" id="mobile-nav-backdrop" type="button" aria-label="Close navigation menu"></button>
       <div id="toast" class="app-toast" role="status"></div>
       {% block content %}{% endblock %}
     </main>

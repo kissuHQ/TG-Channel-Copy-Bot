@@ -16,8 +16,8 @@
   </div>
   <div id="task-dry-run" class="notice hidden"></div>
 </section>
-<section class="surface">
-  <div class="section-header"><div><p class="eyebrow">Queue & history</p><h2>All tasks</h2></div><div class="list-tools"><select id="task-filter" onchange="renderTaskPage()"><option value="all">All statuses</option><option value="running">Running</option><option value="paused">Paused</option><option value="queued">Queued</option><option value="complete">Complete</option><option value="failed">Failed</option></select><button class="button small secondary" onclick="bulkTaskPage('pause')">Pause selected</button><button class="button small secondary" onclick="bulkTaskPage('resume')">Resume selected</button></div></div>
+<section class="surface page-surface">
+  <div class="section-header"><div><p class="eyebrow">Queue & history</p><h2>All tasks</h2></div><div class="list-tools"><select id="task-filter" onchange="renderTaskPage()"><option value="all">All statuses</option><option value="running">Running</option><option value="paused">Paused</option><option value="queued">Queued</option><option value="complete">Complete</option><option value="failed">Failed</option><option value="cancelled">Cancelled</option></select><button class="button small secondary" onclick="bulkTaskPage('pause')">Pause selected</button><button class="button small secondary" onclick="bulkTaskPage('resume')">Resume selected</button></div></div>
   <div id="page-task-list" class="task-card-list"><div class="empty-state">Loading tasks…</div></div>
 </section>
 {% endblock %}

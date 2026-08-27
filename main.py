@@ -92,6 +92,7 @@ MAX_BATCH_TASKS = 5
 MAX_TASK_MESSAGES = 5000
 TASK_PRIORITIES = {"low": 10, "normal": 20, "high": 30}
 RATE_PROFILES = {"very_safe": 5, "balanced": 3, "slow": 10}
+MESSAGE_TYPES = {"text", "photo", "video", "doc", "other"}
 DEFAULT_DAILY_MESSAGES = MAX_TASK_MESSAGES
 DEFAULT_DAILY_MEDIA_MB = 2048
 # Keep a safety margin on the small Replit disk.  This is a hard temporary
@@ -101,6 +102,64 @@ TEMP_DIR = Path("/tmp/archive_bot")
 THUMBNAIL_DIR = Path("thumbnails")
 
 LOG_FILE     = "sync.log"
+
+
+def _bounded_int(value, default, minimum, maximum):
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+def _bounded_float(value, default, minimum, maximum):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+def _normalise_types(value, fallback=None):
+    fallback = fallback or sorted(MESSAGE_TYPES)
+    if isinstance(value, str):
+        value = value.split(",")
+    if not isinstance(value, (list, tuple, set)):
+        return fallback
+    result = [str(item).strip().lower() for item in value if str(item).strip().lower() in MESSAGE_TYPES]
+    return list(dict.fromkeys(result)) or fallback
+
+
+def _normalise_pair_setting(key, value):
+    if key in {"include_keywords", "exclude_keywords"}:
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
+        return [str(item).strip() for item in (value or []) if str(item).strip()]
+    if key in {"allowed_types", "caption_types"}:
+        return _normalise_types(value)
+    if key == "rate_profile":
+        value = str(value).lower()
+        return value if value in RATE_PROFILES else "balanced"
+    if key == "rate_delay":
+        return _bounded_float(value, MSG_DELAY, MIN_RATE_DELAY, 300)
+    if key == "max_messages":
+        return _bounded_int(value, MAX_TASK_MESSAGES, 1, MAX_TASK_MESSAGES)
+    if key == "daily_message_limit":
+        return _bounded_int(value, DEFAULT_DAILY_MESSAGES, 1, MAX_TASK_MESSAGES)
+    if key == "daily_media_mb":
+        return _bounded_int(value, DEFAULT_DAILY_MEDIA_MB, 1, 102400)
+    if key == "max_posts_per_hour":
+        return _bounded_int(value, 0, 0, 10000)
+    if key == "caption_parse_mode":
+        return str(value).lower() if str(value).lower() in {"md", "html", "plain"} else "md"
+    if key == "protected_behavior":
+        return str(value).lower() if str(value).lower() in {"download", "skip"} else "download"
+    if key in {
+        "remove_links", "remove_source_name", "auto_forward",
+        "caption_enabled", "thumbnail_enabled",
+    }:
+        return bool(value)
+    return value
 
 SESSION_FILE = "archive_session"
 STATE_FILE   = "sync_state.json"
@@ -263,7 +322,7 @@ def _pair_config(pair):
     profile = str(pair.get("rate_profile", "balanced")).lower()
     profile_delay = RATE_PROFILES.get(profile, RATE_PROFILES["balanced"])
     return {
-        "allowed_types": pair.get("allowed_types") or ["text", "photo", "video", "doc", "other"],
+        "allowed_types": _normalise_types(pair.get("allowed_types")),
         "include_keywords": [str(x).lower() for x in pair.get("include_keywords", []) if str(x).strip()],
         "exclude_keywords": [str(x).lower() for x in pair.get("exclude_keywords", []) if str(x).strip()],
         "caption_prefix": pair.get("caption_prefix", ""),
@@ -271,13 +330,12 @@ def _pair_config(pair):
         "remove_links": bool(pair.get("remove_links")),
         "remove_source_name": bool(pair.get("remove_source_name")),
         "rate_profile": profile if profile in RATE_PROFILES else "balanced",
-        "rate_delay": max(MIN_RATE_DELAY, min(float(pair.get("rate_delay", profile_delay)), 300)),
-        "max_messages": MAX_TASK_MESSAGES,
-        "daily_message_limit": max(
-            MAX_TASK_MESSAGES,
-            min(int(pair.get("daily_message_limit", DEFAULT_DAILY_MESSAGES)), MAX_TASK_MESSAGES),
+        "rate_delay": _bounded_float(pair.get("rate_delay", profile_delay), profile_delay, MIN_RATE_DELAY, 300),
+        "max_messages": _bounded_int(pair.get("max_messages"), MAX_TASK_MESSAGES, 1, MAX_TASK_MESSAGES),
+        "daily_message_limit": _bounded_int(
+            pair.get("daily_message_limit"), DEFAULT_DAILY_MESSAGES, 1, MAX_TASK_MESSAGES
         ),
-        "daily_media_mb": max(1, min(int(pair.get("daily_media_mb", DEFAULT_DAILY_MEDIA_MB)), 102400)),
+        "daily_media_mb": _bounded_int(pair.get("daily_media_mb"), DEFAULT_DAILY_MEDIA_MB, 1, 102400),
         "auto_forward": bool(pair.get("auto_forward", False)),
         "dedupe_mode": pair.get("dedupe_mode", "strong"),
         "max_posts_per_hour": max(0, min(int(pair.get("max_posts_per_hour", 0) or 0), 10000)),
@@ -288,7 +346,7 @@ def _pair_config(pair):
         "protected_behavior": pair.get("protected_behavior", "download"),
         "caption_enabled": bool(pair.get("caption_enabled", False)),
         "caption_template": str(pair.get("caption_template", "")),
-        "caption_types": pair.get("caption_types") or ["text", "photo", "video", "doc", "other"],
+        "caption_types": _normalise_types(pair.get("caption_types")),
         "caption_parse_mode": str(pair.get("caption_parse_mode", "md")),
         "thumbnail_enabled": bool(pair.get("thumbnail_enabled", False)),
         "thumbnail_path": str(pair.get("thumbnail_path", "")),
@@ -2597,18 +2655,21 @@ async def _create_pair(payload):
         "source": source, "target": target,
         "source_title": getattr(src_entity, "title", str(source)),
         "target_title": getattr(tgt_entity, "title", str(target)),
-        "allowed_types": payload.get("allowed_types") or ["text", "photo", "video", "doc", "other"],
+        "allowed_types": _normalise_types(payload.get("allowed_types")),
         "include_keywords": [x.strip() for x in str(payload.get("include_keywords", "")).split(",") if x.strip()],
         "exclude_keywords": [x.strip() for x in str(payload.get("exclude_keywords", "")).split(",") if x.strip()],
         "caption_prefix": str(payload.get("caption_prefix", "")),
         "caption_suffix": str(payload.get("caption_suffix", "")),
         "remove_links": bool(payload.get("remove_links")),
         "remove_source_name": bool(payload.get("remove_source_name")),
-        "rate_profile": str(payload.get("rate_profile", "balanced")).lower(),
-        "rate_delay": max(MIN_RATE_DELAY, min(float(payload.get("rate_delay", MSG_DELAY)), 300)),
-        "max_messages": MAX_TASK_MESSAGES,
-        "daily_message_limit": MAX_TASK_MESSAGES,
-        "daily_media_mb": max(1, min(int(payload.get("daily_media_mb", DEFAULT_DAILY_MEDIA_MB)), 102400)),
+        "rate_profile": str(payload.get("rate_profile", "balanced")).lower()
+            if str(payload.get("rate_profile", "balanced")).lower() in RATE_PROFILES else "balanced",
+        "rate_delay": _bounded_float(payload.get("rate_delay", MSG_DELAY), MSG_DELAY, MIN_RATE_DELAY, 300),
+        "max_messages": _bounded_int(payload.get("max_messages"), MAX_TASK_MESSAGES, 1, MAX_TASK_MESSAGES),
+        "daily_message_limit": _bounded_int(
+            payload.get("daily_message_limit"), DEFAULT_DAILY_MESSAGES, 1, MAX_TASK_MESSAGES
+        ),
+        "daily_media_mb": _bounded_int(payload.get("daily_media_mb"), DEFAULT_DAILY_MEDIA_MB, 1, 102400),
         "auto_forward": bool(payload.get("auto_forward", True)),
         "dedupe_mode": str(payload.get("dedupe_mode", "strong")),
         "max_posts_per_hour": max(0, min(int(payload.get("max_posts_per_hour", 0) or 0), 10000)),
@@ -2619,7 +2680,7 @@ async def _create_pair(payload):
         "protected_behavior": str(payload.get("protected_behavior", "download")),
         "caption_enabled": bool(payload.get("caption_enabled", False)),
         "caption_template": str(payload.get("caption_template", "")),
-        "caption_types": payload.get("caption_types") or ["text", "photo", "video", "doc", "other"],
+        "caption_types": _normalise_types(payload.get("caption_types")),
         "caption_parse_mode": str(payload.get("caption_parse_mode", "md")),
         "thumbnail_enabled": bool(payload.get("thumbnail_enabled", False)),
         "thumbnail_path": "",
@@ -2868,14 +2929,7 @@ def api_delete_pair(pair_id):
                     "protected_behavior", "caption_enabled", "caption_template",
                     "caption_types", "caption_parse_mode", "thumbnail_enabled"):
             if key in payload:
-                if key in {"include_keywords", "exclude_keywords"}:
-                    value = payload[key]
-                    pair[key] = (
-                        [item.strip() for item in str(value).split(",") if item.strip()]
-                        if isinstance(value, str) else value
-                    )
-                else:
-                    pair[key] = payload[key]
+                pair[key] = _normalise_pair_setting(key, payload[key])
         save_state(state)
         return jsonify({"ok": True, "pair": pair})
     pair = _pair_by_id(pair_id)
@@ -3186,7 +3240,7 @@ def api_task_control(task_id):
                     continue
                 if key in {"include_keywords", "exclude_keywords"} and isinstance(value, str):
                     value = [item.strip() for item in value.split(",") if item.strip()]
-                settings[key] = value
+                settings[key] = _normalise_pair_setting(key, value)
             task["task_settings"] = settings
             for queued in _task_queue:
                 if queued.get("id") == task_id:
