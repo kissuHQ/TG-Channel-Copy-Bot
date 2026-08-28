@@ -163,6 +163,7 @@ def _normalise_pair_setting(key, value):
 
 SESSION_FILE = "archive_session"
 STATE_FILE   = "sync_state.json"
+STATE_BACKUP_FILE = f"{STATE_FILE}.bak"
 STATE_WRITE_LOCK = threading.Lock()
 TELEGRAM_STARTING = True
 
@@ -227,16 +228,30 @@ def persist_session_string():
 
 # ─── STATE MANAGEMENT ─────────────────────────────────
 def load_state():
-    if Path(STATE_FILE).exists():
-        with open(STATE_FILE) as f:
-            return json.load(f)
+    for path in (Path(STATE_FILE), Path(STATE_BACKUP_FILE)):
+        if not path.exists():
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            logging.getLogger("SyncBot").warning(
+                "Could not load state from %s: %s", path, exc
+            )
     return {}
 
 def save_state(state):
     # Flask, the bot and Telethon handlers can persist at the same time.
-    # Atomic replacement keeps the JSON state valid after a restart.
+    # Keep one previous generation so a failed write can be recovered on restart.
     with STATE_WRITE_LOCK:
         tmp_path = f"{STATE_FILE}.tmp"
+        if Path(STATE_FILE).exists():
+            try:
+                shutil.copy2(STATE_FILE, STATE_BACKUP_FILE)
+            except OSError as exc:
+                logging.getLogger("SyncBot").warning(
+                    "Could not update state backup: %s", exc
+                )
         with open(tmp_path, "w") as f:
             json.dump(state, f, indent=2)
         os.replace(tmp_path, STATE_FILE)
@@ -2340,6 +2355,11 @@ async def send_message(target, message, on_progress=None, config=None, source_ti
         getattr(source_entity, "noforwards", False)
         or getattr(message, "noforwards", False)
     )
+    raw_text = getattr(message, "raw_text", None) or getattr(message, "text", None) or ""
+    has_media = bool(message.media and not isinstance(message.media, MessageMediaWebPage))
+    if not raw_text and not has_media:
+        logger.debug("Skipping non-content Telegram service message msg_id=%s", message.id)
+        return False
     if source_restricted and config.get("protected_behavior") == "skip":
         _log_live(f"⏭️ Protected-content skipped ID={message.id}")
         return False
@@ -2348,7 +2368,22 @@ async def send_message(target, message, on_progress=None, config=None, source_ti
             raise ValueError("source channel has forwarding protection")
         if needs_rewrite:
             raise ValueError("caption rewrite requires upload/copy path")
-        sent = await client.send_message(target, message, parse_mode=_parse_mode(config), link_preview=False)
+        if has_media:
+            sent = await client.send_file(
+                target,
+                message.media,
+                caption=raw_text,
+                parse_mode=None,
+                formatting_entities=getattr(message, "entities", None),
+            )
+        else:
+            sent = await client.send_message(
+                target,
+                raw_text,
+                parse_mode=None,
+                formatting_entities=getattr(message, "entities", None),
+                link_preview=False,
+            )
         logger.info(f"⚡ Copied directly msg_id={message.id} (no forward tag)")
         return sent or True
     except Exception as copy_error:
@@ -2856,6 +2891,12 @@ def _status_payload():
         "health": state.get("health", {}),
         "transfer": state.get("transfer"),
         "storage": _storage_snapshot(),
+        "persistence": {
+            "backend": "json",
+            "state_file": STATE_FILE,
+            "backup_file": STATE_BACKUP_FILE,
+            "backup_available": Path(STATE_BACKUP_FILE).exists(),
+        },
         "pair_health": state.get("health", {}),
         "oversized_messages": state.get("oversized_messages", [])[-20:],
         "templates": state.get("templates", {}),
@@ -2902,6 +2943,7 @@ def api_settings():
         "auto_forward": bool(state.get("auto_forward")),
         "storage_limit_mb": round(TEMP_STORAGE_LIMIT_BYTES / 1048576),
         "max_task_messages": MAX_TASK_MESSAGES,
+        "persistence": _status_payload()["persistence"],
     })
 
 

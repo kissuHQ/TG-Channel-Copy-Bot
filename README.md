@@ -315,14 +315,19 @@ Dashboard same-origin Flask API use karta hai. Important endpoints:
 | File/path | Purpose |
 |---|---|
 | `sync_state.json` | Pair configuration, tasks, stats and dedupe state |
+| `sync_state.json.bak` | Previous valid state snapshot used if the main JSON file is damaged |
 | `sync.log` | Detailed application log |
 | `session_string.txt` | Persisted Telethon session |
 | `thumbnails/` | Per-pair thumbnail files |
 | `/tmp/archive_bot/` | Temporary downloaded media |
 
-Sensitive/runtime files ko version control mein commit na karein. `.gitignore`
-mein local session, runtime state, logs aur temporary artifacts exclude karna
-recommended hai.
+Is project mein PostgreSQL tables use nahi ho rahe; configuration aur progress
+JSON state file mein persist hote hain. Har state save se pehle previous valid
+file `sync_state.json.bak` mein rakhi jaati hai, aur startup par damaged main
+file se automatic recovery hoti hai. New hosting par `sync_state.json` ko saath
+copy/restore karein; ismein source, target, pairs, tasks aur dedupe state hoti
+hai, lekin Telegram secrets nahi. `sync_state.json`, uska backup, `sync.log`
+aur `thumbnails/` ko untrusted users ke saath share na karein.
 
 ## Troubleshooting
 
