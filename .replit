@@ -30,15 +30,6 @@ args = "python main.py"
 [workflows.workflow.metadata]
 outputType = "console"
 
-[[workflows.workflow]]
-name = "session"
-mode = "parallel"
-author = 63571679
-
-[[workflows.workflow.tasks]]
-task = "shell.exec"
-args = "python main2.py"
-
 [[ports]]
 localPort = 8080
 externalPort = 80

@@ -87,7 +87,7 @@ function renderDashboard() {
   set('dash-progress-count', `${s.current || 0} / ${s.total || 0}`); set('dash-last-sync', `Last synced ID ${s.last_id || '—'}`);
   set('dash-transfer', s.transfer ? `${s.transfer.phase}: ${s.transfer.file}` : (s.running ? 'Syncing messages' : 'Waiting for a task'));
   const bar = document.getElementById('dash-progress-bar'); if (bar) bar.style.width = `${s.pct || 0}%`;
-  const run = document.getElementById('dash-run-status'); if (run) { run.className = `status-pill ${s.running && s.paused ? 'paused' : s.running ? 'running' : 'neutral'}`; run.textContent = s.paused ? 'Paused' : s.running ? 'Running' : 'Stopped'; }
+  const run = document.getElementById('dash-run-status'); if (run) { const activePaused = !!s.running && !!s.paused; run.className = `status-pill ${activePaused ? 'paused' : s.running ? 'running' : 'neutral'}`; run.textContent = activePaused ? 'Paused' : s.running ? 'Running' : 'Stopped'; }
   const list = document.getElementById('dash-task-list');
   if (list) list.innerHTML = tasks.length ? tasks.slice(-4).reverse().map(task => `<a class="compact-item" href="/tasks/${encodeURIComponent(task.id)}"><div class="compact-item-top"><strong>${esc(task.id)}</strong>${statusPill(task.status)}</div><small>${esc(task.source || 'Source')} → ${esc(task.target || 'Target')} · ${statsTotal(task)} copied</small></a>`).join('') : '<div class="empty-state">No tasks yet. Create your first sync.</div>';
   const health = document.getElementById('dash-health-list');

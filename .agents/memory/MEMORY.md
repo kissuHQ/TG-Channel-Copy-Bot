@@ -1,1 +1,2 @@
 - [Limit-induced task pausing](task-limit-pausing.md) — temporary Telegram/quota limits preserve progress and require explicit continuation.
+- [Workflow entrypoint audit](workflow-entrypoint-audit.md) — imported combined apps may retain a stale secondary workflow.

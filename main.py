@@ -310,6 +310,7 @@ def _task_view(task):
         "resume_min_id": task.get("resume_min_id", task.get("min_id", 0)),
         "resume_max_id": task.get("resume_max_id", task.get("max_id", 0)),
         "task_settings": task.get("task_settings", task.get("config", {})),
+        "error": task.get("error"),
     }
 
 
@@ -643,6 +644,11 @@ async def _task_worker():
             state["stats"] = reset_stats()
             state["current_id"] = 0
             state["total_msgs"] = 0
+            state.pop("_task_pause_requested", None)
+            state.pop("_task_pause_reason", None)
+            state.pop("_task_resume_min_id", None)
+            state.pop("_task_resume_max_id", None)
+            state.pop("_task_failed_reason", None)
             state["tasks"] = [
                 {**item, "status": "running"} if item.get("id") == task["id"] else item
                 for item in state.get("tasks", [])
@@ -658,11 +664,18 @@ async def _task_worker():
                     task.get("force_sync", False),
                     max_id=task.get("resume_max_id", task.get("max_id", 0))
                 )
+                control = state.get("task_controls", {}).get(task["id"], {})
+                failed_reason = state.pop("_task_failed_reason", None)
                 pause_requested = state.pop("_task_pause_requested", False)
                 task["status"] = (
-                    "paused" if pause_requested
+                    "cancelled" if control.get("cancelled")
+                    else ("failed" if failed_reason
+                    else ("paused" if pause_requested
                     else ("partial" if state.pop("_task_partial", False) else "complete")
+                    ))
                 )
+                if failed_reason:
+                    task["error"] = failed_reason
                 if pause_requested:
                     task["pause_reason"] = state.pop("_task_pause_reason", "A limit temporarily stopped this task")
                     task["resume_min_id"] = state.pop("_task_resume_min_id", task.get("min_id", 0))
@@ -756,6 +769,7 @@ def _queue_sync(source, target, reverse=True, min_id=0, limit=None,
                 progress_msg=None, is_bot=False, mode="full", pair_id=None,
                 config=None, priority="normal", force_sync=False):
     pair = _pair_by_id(pair_id)
+    task_config = config or _pair_config(pair)
     task = {
         "id": uuid.uuid4().hex[:8],
         "source": source,
@@ -768,7 +782,8 @@ def _queue_sync(source, target, reverse=True, min_id=0, limit=None,
         "mode": mode,
         "priority": priority if priority in TASK_PRIORITIES else "normal",
         "pair_id": pair_id or "default",
-        "config": config or _pair_config(_pair_by_id(pair_id)),
+        "config": task_config,
+        "task_settings": task_config,
         "progress_msg": progress_msg or WebEvent(),
         "is_bot": is_bot,
         "force_sync": force_sync,
@@ -993,6 +1008,10 @@ async def cmd_setsource(event):
 
     state["source"] = channel
     state["source_title"] = getattr(entity, "title", str(channel))
+    default_pair = _pair_by_id("default")
+    if default_pair:
+        default_pair["source"] = channel
+        default_pair["source_title"] = state["source_title"]
     save_state(state)
     await event.edit(f"✅ Source set: **{state['source_title']}**\n`{channel}`")
 
@@ -1024,6 +1043,10 @@ async def cmd_settarget(event):
 
     state["target"] = channel
     state["target_title"] = getattr(entity, "title", str(channel))
+    default_pair = _pair_by_id("default")
+    if default_pair:
+        default_pair["target"] = channel
+        default_pair["target_title"] = state["target_title"]
     save_state(state)
     await event.edit(f"✅ Target set: **{state['target_title']}**\n`{channel}`")
 
@@ -1453,6 +1476,10 @@ async def bot_setsource(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 channel = fwd_chat
                 state["source"] = channel
                 state["source_title"] = getattr(entity, "title", str(channel))
+                default_pair = _pair_by_id("default")
+                if default_pair:
+                    default_pair["source"] = channel
+                    default_pair["source_title"] = state["source_title"]
                 save_state(state)
                 await msg.reply_text(
                     f"✅ Source set: *{state['source_title']}*\n`{channel}`",
@@ -1477,6 +1504,10 @@ async def bot_setsource(update: Update, context: ContextTypes.DEFAULT_TYPE):
         entity = await client.get_entity(channel)
         state["source"] = channel
         state["source_title"] = getattr(entity, "title", str(channel))
+        default_pair = _pair_by_id("default")
+        if default_pair:
+            default_pair["source"] = channel
+            default_pair["source_title"] = state["source_title"]
         save_state(state)
         await msg.reply_text(
             f"✅ Source set: *{state['source_title']}*\n`{channel}`",
@@ -1500,6 +1531,10 @@ async def bot_settarget(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 channel = fwd_chat
                 state["target"] = channel
                 state["target_title"] = getattr(entity, "title", str(channel))
+                default_pair = _pair_by_id("default")
+                if default_pair:
+                    default_pair["target"] = channel
+                    default_pair["target_title"] = state["target_title"]
                 save_state(state)
                 await msg.reply_text(
                     f"✅ Target set: *{state['target_title']}*\n`{channel}`",
@@ -1524,6 +1559,10 @@ async def bot_settarget(update: Update, context: ContextTypes.DEFAULT_TYPE):
         entity = await client.get_entity(channel)
         state["target"] = channel
         state["target_title"] = getattr(entity, "title", str(channel))
+        default_pair = _pair_by_id("default")
+        if default_pair:
+            default_pair["target"] = channel
+            default_pair["target_title"] = state["target_title"]
         save_state(state)
         await msg.reply_text(
             f"✅ Target set: *{state['target_title']}*\n`{channel}`",
@@ -1730,7 +1769,8 @@ async def start_sync_userbot(event, reverse=True, min_id=0, limit=None):
         return
     source, target = state["source"], state["target"]
     task = _queue_sync(source, target, reverse, min_id, limit, event,
-                       False, "full" if not limit and not min_id else "range")
+                       False, "full" if not limit and not min_id else "range",
+                       pair_id="default")
     await event.edit(
         f"⏳ Task `{task['id']}` queued\n"
         f"📥 {task['source_title']} → 📤 {task['target_title']}\n"
@@ -1746,6 +1786,7 @@ async def start_sync_bot(progress_msg, reverse=True, min_id=0, limit=None,
     task = _queue_sync(
         state["source"], state["target"], reverse, min_id, limit,
         progress_msg, True, "force" if force_sync else ("full" if not limit and not min_id else "range"),
+        pair_id="default",
         force_sync=force_sync
     )
     await progress_msg.edit_text(
@@ -1913,6 +1954,7 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
             if not budget_ok:
                 state["_task_pause_requested"] = True
                 state["_task_pause_reason"] = "Daily message/media limit reached"
+                state["paused"] = True
                 if reverse:
                     state["_task_resume_min_id"] = max(0, message.id - 1)
                 else:
@@ -2125,6 +2167,7 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
                 )
                 state["_task_pause_requested"] = True
                 state["_task_pause_reason"] = f"Telegram FloodWait limit ({wait}s suggested wait)"
+                state["paused"] = True
                 if reverse:
                     state["_task_resume_min_id"] = max(0, message.id - 1)
                 else:
@@ -2143,6 +2186,7 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
                 )
                 state["_task_pause_requested"] = True
                 state["_task_pause_reason"] = f"Target channel slow mode ({wait}s suggested wait)"
+                state["paused"] = True
                 if reverse:
                     state["_task_resume_min_id"] = max(0, message.id - 1)
                 else:
@@ -2260,12 +2304,14 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
 
     except ChannelPrivateError:
         logger.error("ChannelPrivateError — source is private or no access")
+        state["_task_failed_reason"] = "Source channel is private or inaccessible"
         state["running"] = False
         save_state(state)
         await edit_msg("❌ Source channel private hai ya access nahi hai!")
 
     except Exception as e:
         logger.error(f"Fatal sync error: {e}")
+        state["_task_failed_reason"] = f"{type(e).__name__}: {e}"
         state["running"] = False
         save_state(state)
         await edit_msg(f"❌ Fatal error: {e}")
@@ -2404,7 +2450,7 @@ async def send_message(target, message, on_progress=None, config=None, source_ti
     elif message.text:
         sent = await client.send_message(
             target, caption if "caption" in locals() else _edited_caption(message, config, source_title),
-            parse_mode="md", link_preview=False
+            parse_mode=_parse_mode(config), link_preview=False
         )
         return sent or True
 
@@ -2466,7 +2512,11 @@ async def auto_forward_handler(event):
                 if not _message_allowed(message, pair_config):
                     _log_live(f"⏭️ Auto-forward filter skipped ID={message.id}")
                     continue
-                budget_ok, budget_bucket = _daily_budget(route_key[0], pair_config, message)
+                pair_id = pair.get("id", "default")
+                if _is_duplicate(pair_id, message):
+                    _log_live(f"⏭️ Auto-forward duplicate skipped ID={message.id}")
+                    continue
+                budget_ok, budget_bucket = _daily_budget(pair_id, pair_config, message)
                 if not budget_ok:
                     _log_live(f"🛑 Auto-forward daily limit reached for {pair.get('target')}")
                     continue
@@ -2480,9 +2530,9 @@ async def auto_forward_handler(event):
                 auto_stats = state.setdefault("auto_stats", {"sent": 0, "failed": 0})
                 if sent:
                     sent_count += 1
-                    _daily_budget(route_key[0], pair_config, message, commit=True)
-                    _hourly_budget(pair.get("id"), pair_config, commit=True)
-                    _record_dedupe(pair.get("id", "default"), message)
+                    _daily_budget(pair_id, pair_config, message, commit=True)
+                    _hourly_budget(pair_id, pair_config, commit=True)
+                    _record_dedupe(pair_id, message)
                     auto_stats["sent"] += 1
                     _log_live(f"⚡ Auto-forwarded ID={message.id} → {pair.get('target_title', pair['target'])}")
                 else:
@@ -2614,6 +2664,8 @@ class WebEvent:
 
 def _run_async(coro, timeout=25):
     """Run a coroutine from Flask (sync thread) and return result."""
+    if _loop is None or not _loop.is_running():
+        raise RuntimeError("Telegram session is still starting. Please try again in a moment.")
     future = asyncio.run_coroutine_threadsafe(coro, _loop)
     return future.result(timeout=timeout)
 
@@ -2628,6 +2680,10 @@ async def _set_source(channel_input):
     entity = await client.get_entity(ch)
     state["source"] = ch
     state["source_title"] = getattr(entity, "title", str(ch))
+    default_pair = _pair_by_id("default")
+    if default_pair:
+        default_pair["source"] = ch
+        default_pair["source_title"] = state["source_title"]
     save_state(state)
     return {"ok": True, "title": state["source_title"]}
 
@@ -2637,6 +2693,10 @@ async def _set_target(channel_input):
     entity = await client.get_entity(ch)
     state["target"] = ch
     state["target_title"] = getattr(entity, "title", str(ch))
+    default_pair = _pair_by_id("default")
+    if default_pair:
+        default_pair["target"] = ch
+        default_pair["target_title"] = state["target_title"]
     save_state(state)
     return {"ok": True, "title": state["target_title"]}
 
@@ -2806,6 +2866,7 @@ def _status_payload():
 
 def _dashboard_payload():
     return {
+        "ok": True,
         "status": _status_payload(),
         "logs": list(_live_log),
     }
@@ -3086,29 +3147,32 @@ def api_templates():
 
 @flask_app.route("/api/sync", methods=["POST"])
 def api_sync():
-    if not state.get("source") or not state.get("target"):
+    pair = _pair_by_id("default")
+    if not pair or not pair.get("source") or not pair.get("target"):
         return jsonify({"ok": False, "error": "Set source and target first"})
-    task = _queue_sync(state["source"], state["target"], True, 0, None,
-                       WebEvent(), False, "full")
+    task = _queue_sync(pair["source"], pair["target"], True, 0, None,
+                       WebEvent(), False, "full", "default", _pair_config(pair))
     return jsonify({"ok": True, "task": _task_view(task)})
 
 
 @flask_app.route("/api/syncfrom", methods=["POST"])
 def api_syncfrom():
-    if not state.get("source") or not state.get("target"):
+    pair = _pair_by_id("default")
+    if not pair or not pair.get("source") or not pair.get("target"):
         return jsonify({"ok": False, "error": "Set source and target first"})
     try:
         mid = int((request.json or {}).get("min_id", 0))
     except (TypeError, ValueError):
         return jsonify({"ok": False, "error": "Valid message ID required"})
-    task = _queue_sync(state["source"], state["target"], True, mid, None,
-                       WebEvent(), False, "from_id")
+    task = _queue_sync(pair["source"], pair["target"], True, mid, None,
+                       WebEvent(), False, "from_id", "default", _pair_config(pair))
     return jsonify({"ok": True, "task": _task_view(task)})
 
 
 @flask_app.route("/api/synclast", methods=["POST"])
 def api_synclast():
-    if not state.get("source") or not state.get("target"):
+    pair = _pair_by_id("default")
+    if not pair or not pair.get("source") or not pair.get("target"):
         return jsonify({"ok": False, "error": "Set source and target first"})
     try:
         n = int((request.json or {}).get("n", 10))
@@ -3116,8 +3180,8 @@ def api_synclast():
         return jsonify({"ok": False, "error": "Valid message count required"})
     if n < 1:
         return jsonify({"ok": False, "error": "Message count must be positive"})
-    task = _queue_sync(state["source"], state["target"], False, 0, n,
-                       WebEvent(), False, "last")
+    task = _queue_sync(pair["source"], pair["target"], False, 0, n,
+                       WebEvent(), False, "last", "default", _pair_config(pair))
     return jsonify({"ok": True, "task": _task_view(task)})
 
 
@@ -3290,6 +3354,10 @@ def api_tasks_bulk():
                 if queued["id"] == task_id:
                     _task_queue.remove(queued)
             task["status"] = "cancelled"
+        elif action == "resume" and task.get("status") == "paused":
+            ok, _ = _resume_paused_task(task)
+            if not ok:
+                continue
         else:
             paused = action == "pause"
             state.setdefault("task_controls", {}).setdefault(task_id, {})["paused"] = paused
@@ -3330,28 +3398,27 @@ def api_autoforward():
 
 @flask_app.route("/api/pause", methods=["POST"])
 def api_pause():
-    state["paused"] = True
-    save_state(state)
+    if not _set_active_pause(True):
+        return jsonify({"ok": False, "error": "No active sync task"}), 409
     return jsonify({"ok": True})
 
 
 @flask_app.route("/api/resume", methods=["POST"])
 def api_resume():
-    state["paused"] = False
-    save_state(state)
+    if not _set_active_pause(False):
+        return jsonify({"ok": False, "error": "No active sync task"}), 409
     return jsonify({"ok": True})
 
 
 @flask_app.route("/api/stop", methods=["POST"])
 def api_stop():
-    state["running"] = False
-    state["paused"]  = False
-    save_state(state)
+    _stop_all_tasks()
     return jsonify({"ok": True})
 
 
 @flask_app.route("/api/reset", methods=["POST"])
 def api_reset():
+    _stop_all_tasks()
     state.clear()
     save_state(state)
     return jsonify({"ok": True})
