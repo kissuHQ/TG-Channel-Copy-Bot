@@ -483,7 +483,26 @@ def _media_size_mb(message):
     return (getattr(document, "size", 0) or 0) / (1024 * 1024)
 
 
-def _daily_budget(pair_id, config, message, commit=False):
+def _media_requires_download(message, config, source_entity=None):
+    """Return whether this media must use the local download/upload path."""
+    msg_type = get_msg_type(message)
+    source_entity = source_entity or getattr(message, "chat", None)
+    source_restricted = bool(
+        getattr(source_entity, "noforwards", False)
+        or getattr(message, "noforwards", False)
+    )
+    needs_rewrite = any([
+        config.get("caption_prefix"),
+        config.get("caption_suffix"),
+        config.get("remove_links"),
+        config.get("remove_source_name"),
+        config.get("caption_enabled") and msg_type in config.get("caption_types", []),
+        config.get("thumbnail_enabled") and msg_type == "video",
+    ])
+    return source_restricted or needs_rewrite
+
+
+def _daily_budget(pair_id, config, message, commit=False, source_entity=None):
     today = datetime.now().date().isoformat()
     usage = state.setdefault("daily_usage", {})
     bucket = usage.setdefault(str(pair_id or "default"), {"date": today, "messages": 0, "media_mb": 0.0})
@@ -491,14 +510,18 @@ def _daily_budget(pair_id, config, message, commit=False):
         bucket.update({"date": today, "messages": 0, "media_mb": 0.0})
     size_mb = _media_size_mb(message)
     daily_media_limit = config.get("daily_media_mb", DEFAULT_DAILY_MEDIA_MB)
-    permanently_oversized = size_mb > daily_media_limit
+    # Direct Telegram copies never touch local storage, so the download/upload
+    # media quota must not block them regardless of their source file size.
+    requires_download = _media_requires_download(message, config, source_entity)
+    billable_media_mb = size_mb if requires_download else 0
+    permanently_oversized = requires_download and size_mb > daily_media_limit
     allowed = (
         bucket["messages"] < config.get("daily_message_limit", DEFAULT_DAILY_MESSAGES)
-        and bucket["media_mb"] + size_mb <= daily_media_limit
+        and bucket["media_mb"] + billable_media_mb <= daily_media_limit
     )
     if allowed and commit:
         bucket["messages"] += 1
-        bucket["media_mb"] = round(bucket["media_mb"] + size_mb, 2)
+        bucket["media_mb"] = round(bucket["media_mb"] + billable_media_mb, 2)
     return allowed, bucket, permanently_oversized
 
 
@@ -1970,7 +1993,9 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
                         else:
                             daily_media_limit = config.get("daily_media_mb", DEFAULT_DAILY_MEDIA_MB)
                             budget_results = [
-                                (item, *_daily_budget(pair_id, config, item))
+                                (item, *_daily_budget(
+                                    pair_id, config, item, source_entity=source_entity
+                                ))
                                 for item in album
                             ]
                             oversized_items = [
@@ -2032,7 +2057,10 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
                             _record_dedupe(pair_id, item)
                             stats[get_msg_type(item)] = stats.get(get_msg_type(item), 0) + 1
                             if not force_sync:
-                                _daily_budget(pair_id, config, item, commit=True)
+                                _daily_budget(
+                                    pair_id, config, item, commit=True,
+                                    source_entity=source_entity
+                                )
                         count += len(album)
                         state["current_id"] = count
                         state["stats"] = stats
@@ -2058,7 +2086,9 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
             budget_ok, budget_bucket, permanently_oversized = (
                 (True, None, False)
                 if force_sync
-                else _daily_budget(pair_id, config, message)
+                else _daily_budget(
+                    pair_id, config, message, source_entity=source_entity
+                )
             )
             if not budget_ok:
                 if permanently_oversized:
@@ -2219,7 +2249,10 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
                             dedupe.pop(old_key, None)
                     count += 1
                     stats[msg_type] = stats.get(msg_type, 0) + 1
-                    _daily_budget(pair_id, config, message, commit=True)
+                    _daily_budget(
+                        pair_id, config, message, commit=True,
+                        source_entity=source_entity
+                    )
                     state["last_synced_id"] = message.id
                     state["current_id"]     = count
                     state["stats"]          = stats
@@ -2653,7 +2686,7 @@ async def auto_forward_handler(event):
                     _log_live(f"⏭️ Auto-forward duplicate skipped ID={message.id}")
                     continue
                 budget_ok, budget_bucket, _permanently_oversized = _daily_budget(
-                    pair_id, pair_config, message
+                    pair_id, pair_config, message, source_entity=source_entity
                 )
                 if not budget_ok:
                     _log_live(f"🛑 Auto-forward daily limit reached for {pair.get('target')}")
@@ -2668,7 +2701,10 @@ async def auto_forward_handler(event):
                 auto_stats = state.setdefault("auto_stats", {"sent": 0, "failed": 0})
                 if sent:
                     sent_count += 1
-                    _daily_budget(pair_id, pair_config, message, commit=True)
+                    _daily_budget(
+                        pair_id, pair_config, message, commit=True,
+                        source_entity=source_entity
+                    )
                     _hourly_budget(pair_id, pair_config, commit=True)
                     _record_dedupe(pair_id, message)
                     auto_stats["sent"] += 1
