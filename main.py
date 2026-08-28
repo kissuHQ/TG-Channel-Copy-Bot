@@ -490,14 +490,16 @@ def _daily_budget(pair_id, config, message, commit=False):
     if bucket.get("date") != today:
         bucket.update({"date": today, "messages": 0, "media_mb": 0.0})
     size_mb = _media_size_mb(message)
+    daily_media_limit = config.get("daily_media_mb", DEFAULT_DAILY_MEDIA_MB)
+    permanently_oversized = size_mb > daily_media_limit
     allowed = (
         bucket["messages"] < config.get("daily_message_limit", DEFAULT_DAILY_MESSAGES)
-        and bucket["media_mb"] + size_mb <= config.get("daily_media_mb", DEFAULT_DAILY_MEDIA_MB)
+        and bucket["media_mb"] + size_mb <= daily_media_limit
     )
     if allowed and commit:
         bucket["messages"] += 1
         bucket["media_mb"] = round(bucket["media_mb"] + size_mb, 2)
-    return allowed, bucket
+    return allowed, bucket, permanently_oversized
 
 
 async def send_album(target, messages, on_progress=None, config=None,
@@ -1886,6 +1888,42 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
         stats   = reset_stats()
         _last_edit = 0   # throttle edit calls (max 1 per sec)
         handled_albums = set()
+        oversized_album_message_ids = set()
+
+        async def record_permanently_oversized(message, size_mb, daily_media_limit):
+            nonlocal failed
+            failed += 1
+            stats["failed"] = failed
+            link = _message_link(source_entity, message)
+            reason = (
+                f"Media size {size_mb:.2f} MB exceeds the pair's daily media limit "
+                f"of {daily_media_limit} MB"
+            )
+            record = {
+                "task_id": task_id, "pair_id": pair_id, "message_id": message.id,
+                "reason": reason, "link": link,
+                "created_at": datetime.now().isoformat(timespec="seconds")
+            }
+            state.setdefault("oversized_messages", []).append(record)
+            state["oversized_messages"] = state["oversized_messages"][-500:]
+            state["stats"] = stats
+            save_state(state)
+            _log_live(
+                f"⏭️ Permanently oversized ID={message.id}: "
+                f"{size_mb:.2f} MB > {daily_media_limit} MB daily media limit"
+            )
+            logger.warning(
+                f"Skipped permanently oversized msg_id={message.id}: "
+                f"{size_mb:.2f} MB > {daily_media_limit} MB daily media limit"
+            )
+            alert = (
+                f"⚠️ Permanently oversized media: task {task_id or 'sync'}, "
+                f"message {message.id}\n"
+                f"Size: {size_mb:.2f} MB | Daily limit: {daily_media_limit} MB"
+            )
+            alert += f"\nLink: {link}" if link else "\nLink unavailable (private channel permission)."
+            await _notify_owner(alert)
+            await asyncio.sleep(1)
 
         async for message in client.iter_messages(
             source_entity,
@@ -1926,10 +1964,63 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
                         item for item in album
                         if not _is_duplicate(pair_id, item)
                     ]
-                    if album and (
-                        force_sync
-                        or all(_daily_budget(pair_id, config, item)[0] for item in album)
-                    ):
+                    if album:
+                        if force_sync:
+                            sendable_album = album
+                        else:
+                            daily_media_limit = config.get("daily_media_mb", DEFAULT_DAILY_MEDIA_MB)
+                            budget_results = [
+                                (item, *_daily_budget(pair_id, config, item))
+                                for item in album
+                            ]
+                            oversized_items = [
+                                (item, allowed, bucket, size_mb)
+                                for item, allowed, bucket, permanently_oversized
+                                in budget_results
+                                if permanently_oversized
+                                for size_mb in [_media_size_mb(item)]
+                            ]
+                            for item, _allowed, _bucket, size_mb in oversized_items:
+                                oversized_album_message_ids.add(item.id)
+                                await record_permanently_oversized(
+                                    item, size_mb, daily_media_limit
+                                )
+                            sendable_album = [
+                                item for item, allowed, _bucket, permanently_oversized
+                                in budget_results
+                                if not permanently_oversized
+                            ]
+                            if sendable_album and any(
+                                not allowed
+                                for item, allowed, _bucket, permanently_oversized
+                                in budget_results
+                                if not permanently_oversized
+                            ):
+                                state["_task_pause_requested"] = True
+                                state["_task_pause_reason"] = "Daily message/media limit reached"
+                                state["paused"] = True
+                                if reverse:
+                                    state["_task_resume_min_id"] = max(0, message.id - 1)
+                                else:
+                                    state["_task_resume_max_id"] = message.id + 1
+                                save_state(state)
+                                bucket = next(
+                                    bucket for item, allowed, bucket, permanently_oversized
+                                    in budget_results
+                                    if not permanently_oversized and not allowed
+                                )
+                                _log_live(
+                                    f"⏸️ Daily limit reached for pair {pair_id}: "
+                                    f"{bucket['messages']} messages / {bucket['media_mb']:.1f} MB"
+                                )
+                                break
+                            if not sendable_album:
+                                _log_live(
+                                    f"⏭️ Album skipped: all {len(oversized_items)} "
+                                    f"items are permanently oversized"
+                                )
+                                continue
+                            album = sendable_album
                         sent_album = await send_album(
                             target_entity, album, config=config,
                             source_title=src_title, source_entity=source_entity
@@ -1950,6 +2041,9 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
                         await asyncio.sleep(max(MIN_RATE_DELAY, config["rate_delay"] + random.uniform(-0.5, 0.5)))
                         continue
 
+            if message.id in oversized_album_message_ids:
+                continue
+
             if not _message_allowed(message, config):
                 stats = state.get("stats", stats)
                 stats["skipped"] = stats.get("skipped", 0) + 1
@@ -1961,12 +2055,19 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
                 stats["duplicates"] = stats.get("duplicates", 0) + 1
                 _log_live(f"⏭️ Duplicate skipped ID={message.id}")
                 continue
-            budget_ok, budget_bucket = (
-                (True, None)
+            budget_ok, budget_bucket, permanently_oversized = (
+                (True, None, False)
                 if force_sync
                 else _daily_budget(pair_id, config, message)
             )
             if not budget_ok:
+                if permanently_oversized:
+                    await record_permanently_oversized(
+                        message,
+                        _media_size_mb(message),
+                        config.get("daily_media_mb", DEFAULT_DAILY_MEDIA_MB),
+                    )
+                    continue
                 state["_task_pause_requested"] = True
                 state["_task_pause_reason"] = "Daily message/media limit reached"
                 state["paused"] = True
@@ -2551,7 +2652,9 @@ async def auto_forward_handler(event):
                 if _is_duplicate(pair_id, message):
                     _log_live(f"⏭️ Auto-forward duplicate skipped ID={message.id}")
                     continue
-                budget_ok, budget_bucket = _daily_budget(pair_id, pair_config, message)
+                budget_ok, budget_bucket, _permanently_oversized = _daily_budget(
+                    pair_id, pair_config, message
+                )
                 if not budget_ok:
                     _log_live(f"🛑 Auto-forward daily limit reached for {pair.get('target')}")
                     continue
