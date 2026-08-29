@@ -96,7 +96,26 @@ function renderDashboard() {
   if (storage) storage.innerHTML = `<strong>${store.used_mb || 0} MB</strong> <span>of ${store.limit_mb || '—'} MB used</span><div class="progress-track"><span style="width:${store.limit_bytes ? Math.min(100, store.used_bytes / store.limit_bytes * 100) : 0}%"></span></div>`;
 }
 function renderPageLists() { if (page === 'dashboard') renderDashboard(); if (page === 'tasks') renderTaskPage(); if (page === 'pairs') renderPairPage(); }
+function renderTaskPairOptions() {
+  const select = document.getElementById('task-pair');
+  if (!select) return;
+  const selected = select.value;
+  const pairs = Array.isArray(appData.pairs) ? appData.pairs : [];
+  if (!pairs.length) {
+    select.innerHTML = '<option value="" disabled selected>No pairs</option>';
+    return;
+  }
+  select.innerHTML = pairs.map(pair => {
+    const name = String(pair.name || '').trim();
+    const source = pair.source_title || pair.source || 'Source';
+    const target = pair.target_title || pair.target || 'Target';
+    const label = name || `${source} → ${target}`;
+    return `<option value="${esc(pair.id)}">${esc(label)}</option>`;
+  }).join('');
+  if (pairs.some(pair => String(pair.id) === selected)) select.value = selected;
+}
 function renderTaskPage() {
+  renderTaskPairOptions();
   const list = document.getElementById('page-task-list'); if (!list) return;
   const filter = document.getElementById('task-filter')?.value || 'all';
   const tasks = appData.tasks.filter(task => filter === 'all' || task.status === filter).slice().reverse();
