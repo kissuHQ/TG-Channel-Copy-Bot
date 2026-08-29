@@ -256,7 +256,10 @@
     "document:6093490572096442544:460008114:Woman.of.the.Hour.2024.720p.NF.WEB-DL.AAC5.1.AV1-PrimeFix.mkv:video/x-matroska": "2026-08-28T06:45:19",
     "86c4f48571f4d781420f8c58c291f587a0a9b2e9bb8de9f9cb3180179455c969": "2026-08-28T06:45:23",
     "default:media:47b60374f65c73648df12cdf18e5fd27277c447a998a010f800f255a72f22335": "2026-08-28T06:45:23",
-    "document:6093490572096442545:393551975:Woman.of.the.Hour.2024.720p.NF.WEB-DL.AAC5.1.H.265-PrimeFix.mkv:video/x-matroska": "2026-08-28T06:45:23"
+    "document:6093490572096442545:393551975:Woman.of.the.Hour.2024.720p.NF.WEB-DL.AAC5.1.H.265-PrimeFix.mkv:video/x-matroska": "2026-08-28T06:45:23",
+    "77c71bab4ae8290425493aed6a10ef50b9ec228c81536895ede5ded6bd93bd26": "2026-08-28T06:45:26",
+    "default:media:c0f51bdf2ba18acb0a29402cf25149f5511662dbc4ec0268d1370ed7bc16f723": "2026-08-28T06:45:26",
+    "document:5893214301463778210:2084396499:Phir Aayi Hasseen Dillruba (2024) 1080p 10bit NF HIN WEBRip .mkv:video/x-matroska": "2026-08-28T06:45:26"
   },
   "task_controls": {
     "86cc7785": {
@@ -300,7 +303,8 @@
       "423": 807,
       "424": 808,
       "425": 809,
-      "426": 810
+      "426": 810,
+      "428": 811
     }
   },
   "media_fingerprints": {},
@@ -338,28 +342,28 @@
   "source": -1002718041215,
   "source_title": "CineVerse Hub Official",
   "source_last_ids": {
-    "default": 426
+    "default": 428
   },
   "running": true,
   "paused": false,
   "stats": {
     "text": 1,
     "photo": 0,
-    "video": 28,
+    "video": 29,
     "doc": 0,
     "other": 0,
     "failed": 0
   },
-  "current_id": 29,
+  "current_id": 30,
   "total_msgs": 1898,
   "daily_usage": {
     "default": {
       "date": "2026-08-28",
-      "messages": 31,
+      "messages": 32,
       "media_mb": 1521.96
     }
   },
-  "last_synced_id": 426,
+  "last_synced_id": 428,
   "active_task_id": "6f130859",
   "hourly_usage": {
     "default": {
