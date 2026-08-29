@@ -18,6 +18,10 @@ async function request(path, options = {}) {
       fetchOptions.headers['Content-Type'] = 'application/json';
     }
     const response = await fetch(path, fetchOptions);
+    if (response.status === 401) {
+      window.location.assign('/login');
+      return {ok:false, error:'Authentication required'};
+    }
     const text = await response.text();
     let result;
     try { result = text ? JSON.parse(text) : {}; } catch (_) {

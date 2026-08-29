@@ -14,6 +14,7 @@ import json
 import logging
 import time
 import io
+import hmac
 import hashlib
 import re
 import csv
@@ -21,12 +22,16 @@ import threading
 import tempfile
 import uuid
 import random
+import secrets
 import shutil
 import mimetypes
 from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
-from flask import Flask, Response, render_template, jsonify, request, stream_with_context
+from flask import (
+    Flask, Response, render_template, jsonify, request, session,
+    redirect, url_for, stream_with_context,
+)
 from telethon import TelegramClient, events
 from telethon.network import ConnectionTcpAbridged
 from telethon.tl.types import (
@@ -78,6 +83,14 @@ API_HASH     = _require_env("API_HASH")
 PHONE        = _require_env("PHONE")
 OWNER_ID     = int(_require_env("OWNER_ID"))
 BOT_TOKEN    = _require_env("BOT_TOKEN")
+DASHBOARD_PASSWORD = _require_env("DASHBOARD_PASSWORD")
+FLASK_SECRET_KEY = os.getenv("FLASK_SECRET_KEY", "").strip()
+if not FLASK_SECRET_KEY:
+    FLASK_SECRET_KEY = secrets.token_urlsafe(32)
+    logging.getLogger("SyncBot").warning(
+        "FLASK_SECRET_KEY is not set; dashboard sessions will reset on restart. "
+        "Set it in Replit Secrets for persistent sessions."
+    )
 SESSION_STRING_FILE = "session_string.txt"
 SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
 if not SESSION_STRING and Path(SESSION_STRING_FILE).exists():
@@ -1248,6 +1261,21 @@ def _stop_all_tasks():
     save_state(state)
 
 
+def _reset_state_defaults():
+    """Rebuild the same clean state used by every reset entry point."""
+    state.clear()
+    state.update({
+        "pairs": [],
+        "tasks": [],
+        "task_controls": {},
+        "auto_forward": False,
+        "auto_stats": {"sent": 0, "failed": 0},
+        "dedupe": {},
+        "message_map": {},
+        "oversized_messages": [],
+    })
+
+
 @client.on(events.NewMessage(outgoing=True, pattern=r"^\.pause$"))
 async def cmd_pause(event):
     if not is_owner(event.sender_id):
@@ -1284,17 +1312,7 @@ async def cmd_reset(event):
     if not is_owner(event.sender_id):
         return
     _stop_all_tasks()
-    state.clear()
-    state.update({
-        "pairs": [],
-        "tasks": [],
-        "task_controls": {},
-        "auto_forward": False,
-        "auto_stats": {"sent": 0, "failed": 0},
-        "dedupe": {},
-        "message_map": {},
-        "oversized_messages": [],
-    })
+    _reset_state_defaults()
     save_state(state)
     await event.edit("🔄 Config reset!")
 
@@ -1693,17 +1711,7 @@ async def bot_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not bot_is_owner(update):
         return
     _stop_all_tasks()
-    state.clear()
-    state.update({
-        "pairs": [],
-        "tasks": [],
-        "task_controls": {},
-        "auto_forward": False,
-        "auto_stats": {"sent": 0, "failed": 0},
-        "dedupe": {},
-        "message_map": {},
-        "oversized_messages": [],
-    })
+    _reset_state_defaults()
     save_state(state)
     await update.message.reply_text("🔄 Config reset kar diya!")
 
@@ -2761,6 +2769,11 @@ def get_msg_type(message) -> str:
 # ════════════════════════════════════════════════════════
 
 flask_app  = Flask(__name__)
+flask_app.secret_key = FLASK_SECRET_KEY
+flask_app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+)
 _start_time = time.time()
 _loop: asyncio.AbstractEventLoop = None   # set in main()
 _bot_application = None
@@ -2959,6 +2972,44 @@ async def _dry_run_many(pairs, mode, value):
 
 
 # ── Routes ─────────────────────────────────────────────
+
+@flask_app.before_request
+def require_dashboard_auth():
+    if (
+        request.endpoint in {"login", "static", "favicon"}
+        or request.path == "/health"
+    ):
+        return None
+    if session.get("dashboard_authenticated"):
+        return None
+    if request.path == "/api" or request.path.startswith("/api/"):
+        return jsonify({"ok": False, "error": "Authentication required"}), 401
+    return redirect(url_for("login", next=request.path))
+
+
+def _safe_next_path(value):
+    return value if value and value.startswith("/") and not value.startswith("//") else "/dashboard"
+
+
+@flask_app.route("/login", methods=["GET", "POST"])
+def login():
+    next_path = _safe_next_path(request.args.get("next") or request.form.get("next"))
+    error = None
+    if request.method == "POST":
+        password = request.form.get("password", "")
+        if hmac.compare_digest(password, DASHBOARD_PASSWORD):
+            session.clear()
+            session["dashboard_authenticated"] = True
+            return redirect(next_path)
+        error = "Incorrect password. Please try again."
+    return render_template("login.html", error=error, next_path=next_path)
+
+
+@flask_app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
 
 @flask_app.route("/")
 def index():
@@ -3476,7 +3527,8 @@ def api_task_control(task_id):
             editable = {
                 "include_keywords", "exclude_keywords", "caption_prefix", "caption_suffix",
                 "remove_links", "remove_source_name", "caption_enabled", "caption_template",
-                "thumbnail_enabled", "rate_delay", "max_messages", "daily_media_mb",
+                "thumbnail_enabled", "rate_delay", "max_messages", "daily_message_limit",
+                "daily_media_mb",
                 "protected_behavior", "schedule_start", "schedule_end", "quiet_start",
                 "quiet_end", "max_posts_per_hour", "caption_parse_mode",
             }
@@ -3600,7 +3652,7 @@ def api_stop():
 @flask_app.route("/api/reset", methods=["POST"])
 def api_reset():
     _stop_all_tasks()
-    state.clear()
+    _reset_state_defaults()
     save_state(state)
     return jsonify({"ok": True})
 
