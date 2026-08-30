@@ -493,7 +493,28 @@ def _message_allowed(message, config):
 def _media_size_mb(message):
     media = getattr(message, "media", None)
     document = getattr(media, "document", None)
-    return (getattr(document, "size", 0) or 0) / (1024 * 1024)
+    if document:
+        return (getattr(document, "size", 0) or 0) / (1024 * 1024)
+
+    photo = getattr(media, "photo", None)
+    if not photo:
+        return 0
+
+    byte_sizes = []
+    for photo_size in getattr(photo, "sizes", None) or []:
+        size = getattr(photo_size, "size", None)
+        if isinstance(size, (int, float)) and size > 0:
+            byte_sizes.append(size)
+            continue
+        # PhotoSizeProgressive stores its encoded byte sizes in `sizes`,
+        # while PhotoStrippedSize/PhotoCachedSize expose no usable size.
+        progressive_sizes = getattr(photo_size, "sizes", None)
+        if isinstance(progressive_sizes, (list, tuple)):
+            byte_sizes.extend(
+                value for value in progressive_sizes
+                if isinstance(value, (int, float)) and value > 0
+            )
+    return (max(byte_sizes, default=0)) / (1024 * 1024)
 
 
 def _media_requires_download(message, config, source_entity=None):
@@ -1895,10 +1916,27 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
         source_entity = await client.get_entity(source)
         target_entity = await client.get_entity(target)
 
-        total = await client.get_messages(source_entity, limit=0)
         pair_limit = config.get("max_messages", MAX_TASK_MESSAGES)
         effective_limit = min(limit, pair_limit) if limit else pair_limit
-        total_count = min(total.total, effective_limit)
+        if min_id or max_id:
+            # Telethon's limit=0 path uses an unbounded GetHistoryRequest;
+            # its `.total` is therefore the whole channel total even when
+            # min_id/max_id were supplied. Count only the bounded range, and
+            # stop at the same cap used by the actual sync iterator.
+            scoped_total = 0
+            async for _ in client.iter_messages(
+                source_entity,
+                reverse=reverse,
+                min_id=min_id,
+                max_id=max_id or None,
+                limit=effective_limit,
+                wait_time=0,
+            ):
+                scoped_total += 1
+            total_count = min(scoped_total, effective_limit)
+        else:
+            total = await client.get_messages(source_entity, limit=0)
+            total_count = min(total.total, effective_limit)
         state["total_msgs"] = total_count
         save_state(state)
 
@@ -1955,6 +1993,80 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
             alert += f"\nLink: {link}" if link else "\nLink unavailable (private channel permission)."
             await _notify_owner(alert)
             await asyncio.sleep(1)
+
+        control = state.setdefault("task_controls", {}).setdefault(
+            task_id or "legacy", {"paused": False, "cancelled": False}
+        )
+
+        async def wait_for_bulk_limits():
+            """Wait for recurring pair windows without pausing the task."""
+            wait_reason = None
+            while True:
+                control = state.get("task_controls", {}).get(task_id or "legacy", control)
+                if control.get("cancelled") or not state.get("running"):
+                    return False
+                while control.get("paused") and not control.get("cancelled"):
+                    await asyncio.sleep(2)
+                    control = state.get("task_controls", {}).get(task_id or "legacy", control)
+                if control.get("cancelled") or not state.get("running"):
+                    return False
+
+                if not _within_schedule(config):
+                    now = datetime.now()
+                    if _time_in_window(now, config.get("quiet_start"), config.get("quiet_end")):
+                        reason = "quiet hours to end"
+                    else:
+                        reason = "schedule window to open"
+                    if reason != wait_reason:
+                        wait_reason = reason
+                        state["wait_reason"] = reason
+                        save_state(state)
+                        _log_live(f"⏳ Waiting for {reason} before bulk sync sends")
+                    wait_seconds = 60
+                else:
+                    hourly_ok, bucket = _hourly_budget(pair_id, config)
+                    if not hourly_ok:
+                        reason = "hourly limit reset"
+                        if reason != wait_reason:
+                            wait_reason = reason
+                            state["wait_reason"] = reason
+                            save_state(state)
+                            _log_live(
+                                f"⏳ Hourly limit reached "
+                                f"({bucket['count']}/{config.get('max_posts_per_hour')}), "
+                                "waiting for next hour"
+                            )
+                        now = datetime.now()
+                        wait_seconds = min(
+                            60,
+                            max(
+                                1,
+                                3600 - (
+                                    now.minute * 60
+                                    + now.second
+                                    + now.microsecond / 1_000_000
+                                ),
+                            ),
+                        )
+                    else:
+                        if wait_reason is not None:
+                            state.pop("wait_reason", None)
+                            save_state(state)
+                            _log_live("▶️ Bulk sync send window is available again")
+                        return True
+
+                deadline = time.monotonic() + wait_seconds
+                while True:
+                    control = state.get("task_controls", {}).get(task_id or "legacy", control)
+                    if control.get("cancelled") or not state.get("running"):
+                        return False
+                    if control.get("paused"):
+                        await asyncio.sleep(2)
+                        continue
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    await asyncio.sleep(min(2, remaining))
 
         async for message in client.iter_messages(
             source_entity,
@@ -2054,6 +2166,8 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
                                 )
                                 continue
                             album = sendable_album
+                        if not await wait_for_bulk_limits():
+                            break
                         sent_album = await send_album(
                             target_entity, album, config=config,
                             source_title=src_title, source_entity=source_entity
@@ -2069,6 +2183,7 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
                                     pair_id, config, item, commit=True,
                                     source_entity=source_entity
                                 )
+                        _hourly_budget(pair_id, config, commit=True)
                         count += len(album)
                         state["current_id"] = count
                         state["stats"] = stats
@@ -2118,6 +2233,9 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
                     f"⏸️ Daily limit reached for pair {pair_id}: "
                     f"{budget_bucket['messages']} messages / {budget_bucket['media_mb']:.1f} MB"
                 )
+                break
+
+            if not await wait_for_bulk_limits():
                 break
 
             # ── Progress callback (live log + bot preview) ────
@@ -2261,6 +2379,7 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
                         pair_id, config, message, commit=True,
                         source_entity=source_entity
                     )
+                    _hourly_budget(pair_id, config, commit=True)
                     state["last_synced_id"] = message.id
                     state["current_id"]     = count
                     state["stats"]          = stats
