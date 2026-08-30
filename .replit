@@ -1,11 +1,11 @@
-modules = ["python-3.12", "web"]
+modules = ["python-3.12", "web", "nodejs-24"]
 [agent]
 expertMode = true
 stack = "BEST_EFFORT_FALLBACK"
 
 [nix]
 channel = "stable-25_05"
-packages = ["cargo", "libiconv", "openssl", "rustc"]
+packages = ["cargo", "freetype", "lcms2", "libiconv", "libimagequant", "libjpeg", "libtiff", "libwebp", "libxcrypt", "openjpeg", "openssl", "rustc", "tcl", "tk", "zlib"]
 
 [workflows]
 runButton = "Project"

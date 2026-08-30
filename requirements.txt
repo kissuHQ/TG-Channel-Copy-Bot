@@ -1,4 +1,6 @@
 telethon
-python-telegram-bot==22.8
 flask
 cryptg
+Pillow
+python-telegram-bot==22.8
+telegram

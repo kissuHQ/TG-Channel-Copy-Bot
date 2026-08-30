@@ -28,6 +28,7 @@ import mimetypes
 from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
+from PIL import Image, ImageOps
 from flask import (
     Flask, Response, render_template, jsonify, request, session,
     redirect, url_for, stream_with_context,
@@ -36,7 +37,8 @@ from telethon import TelegramClient, events
 from telethon.network import ConnectionTcpAbridged
 from telethon.tl.types import (
     MessageMediaPhoto, MessageMediaDocument,
-    MessageMediaWebPage, DocumentAttributeFilename
+    MessageMediaWebPage, DocumentAttributeFilename,
+    DocumentAttributeAudio, DocumentAttributeVideo,
 )
 from telethon.tl.types import (
     InputMessagesFilterPhotos,
@@ -382,6 +384,40 @@ def _pair_config(pair):
     }
 
 
+def _prepare_thumbnail(source_path):
+    """Convert an uploaded image to a Telegram-compatible JPEG thumbnail."""
+    source_path = Path(source_path)
+    output_path = source_path.with_suffix(".jpg")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    max_bytes = 50 * 1024
+    max_sides = (320, 256, 200, 160, 128, 100)
+    qualities = (85, 75, 65, 55, 45, 40)
+
+    with Image.open(source_path) as image:
+        image = ImageOps.exif_transpose(image).convert("RGB")
+        original_width, original_height = image.size
+        if not original_width or not original_height:
+            raise ValueError("Thumbnail image has invalid dimensions")
+
+        for max_side in max_sides:
+            resized = image.copy()
+            resized.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+            for quality in qualities:
+                resized.save(
+                    output_path,
+                    format="JPEG",
+                    quality=quality,
+                    optimize=True,
+                    progressive=True,
+                )
+                if output_path.stat().st_size <= max_bytes:
+                    return output_path
+
+        # Extremely noisy images can still exceed the target at the floor.
+        # Keep the valid JPEG rather than retrying indefinitely.
+        return output_path
+
+
 class StorageLimitError(RuntimeError):
     """Raised before a download can exceed the temporary disk budget."""
     def __init__(self, message, required=0, available=0):
@@ -604,6 +640,83 @@ async def send_album(target, messages, on_progress=None, config=None,
                 pass
 
 
+def _format_duration(seconds):
+    try:
+        total_seconds = max(0, int(round(float(seconds or 0))))
+    except (TypeError, ValueError):
+        return ""
+    minutes, seconds = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
+
+
+def _caption_media_values(message):
+    media = getattr(message, "media", None)
+    document = getattr(media, "document", None)
+    attributes = getattr(document, "attributes", None) or []
+    duration = ""
+    resolution = ""
+
+    video = next(
+        (attribute for attribute in attributes
+         if isinstance(attribute, DocumentAttributeVideo)),
+        None,
+    )
+    audio = next(
+        (attribute for attribute in attributes
+         if isinstance(attribute, DocumentAttributeAudio)),
+        None,
+    )
+    duration_attribute = video or audio
+    if duration_attribute:
+        duration = _format_duration(getattr(duration_attribute, "duration", 0))
+    if video:
+        width = getattr(video, "w", 0)
+        height = getattr(video, "h", 0)
+        if width and height:
+            resolution = f"{width}x{height}"
+
+    photo = getattr(media, "photo", None)
+    photo_sizes = [
+        size for size in (getattr(photo, "sizes", None) or [])
+        if getattr(size, "w", 0) and getattr(size, "h", 0)
+    ]
+    if photo_sizes and not resolution:
+        largest = max(
+            photo_sizes,
+            key=lambda size: getattr(size, "w", 0) * getattr(size, "h", 0),
+        )
+        resolution = f"{largest.w}x{largest.h}"
+
+    return {"duration": duration, "resolution": resolution}
+
+
+def _caption_template_error(template):
+    """Return a user-facing validation error, or None for a valid template."""
+    if not template:
+        return None
+    try:
+        template.format_map(_SafeFormat({
+            "caption": "Sample caption",
+            "filename": "video.mp4",
+            "filesize": "12.3 MB",
+            "filesize_mb": "12.30",
+            "message_id": "12345",
+            "source": "Example source",
+            "date": "2026-08-30",
+            "time": "12:34",
+            "mime": "video/mp4",
+            "type": "video",
+            "duration": "1:05",
+            "resolution": "1920x1080",
+        }))
+    except (ValueError, KeyError, IndexError, AttributeError, TypeError) as error:
+        return f"Invalid caption template: {error}"
+    return None
+
+
 def _edited_caption(message, config, source_title=""):
     msg_type = get_msg_type(message)
     text = message.text or ""
@@ -619,12 +732,13 @@ def _edited_caption(message, config, source_title=""):
             filename = next((a.file_name for a in (document.attributes or [])
                              if isinstance(a, DocumentAttributeFilename)), "")
         size = getattr(document, "size", 0) or 0
+        media_values = _caption_media_values(message)
         values = {
             "caption": text, "filename": filename, "filesize": _human_size(size),
             "filesize_mb": f"{size / 1048576:.2f}", "message_id": str(getattr(message, "id", "")),
             "source": source_title, "date": datetime.now().strftime("%Y-%m-%d"),
             "time": datetime.now().strftime("%H:%M"), "mime": getattr(document, "mime_type", "") if document else "",
-            "type": msg_type,
+            "type": msg_type, **media_values,
         }
         template = config.get("caption_template", "")
         if template:
@@ -1455,6 +1569,8 @@ async def bot_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<code>/tasks</code> — Queue ke tasks dekho\n"
         "<code>/autoforward on|off</code> — New posts automatically copy karo\n"
         "<code>/caption &lt;pair_id&gt; on|off [template]</code> — Caption rules set karo\n"
+        "Caption placeholders: {caption} {filename} {filesize} {filesize_mb} {message_id} "
+        "{source} {date} {time} {mime} {type} {duration} {resolution}\n"
         "<code>/setthumbnail &lt;pair_id&gt;</code> — Photo/image ko reply karke thumbnail set karo\n"
         "<code>/pause</code> — Sync pause karo\n"
         "<code>/resume</code> — Sync resume karo\n"
@@ -1474,7 +1590,8 @@ async def bot_caption(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Usage: /caption <pair_id> on|off [template]\n"
             "Placeholders: {caption} {filename} {filesize} {filesize_mb} "
-            "{message_id} {source} {date} {time} {mime} {type}"
+            "{message_id} {source} {date} {time} {mime} {type} "
+            "{duration} {resolution}"
         )
         return
     pair = _pair_by_id(context.args[0])
@@ -1489,9 +1606,15 @@ async def bot_caption(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if value.strip() in {"text", "photo", "video", "doc", "other"}
         ]
         template_args = template_args[1:]
+    template = " ".join(template_args) if template_args else None
+    if template is not None:
+        template_error = _caption_template_error(template)
+        if template_error:
+            await update.message.reply_text(f"❌ {template_error}")
+            return
     pair["caption_enabled"] = enabled
-    if template_args:
-        pair["caption_template"] = " ".join(template_args)
+    if template is not None:
+        pair["caption_template"] = template
     save_state(state)
     await update.message.reply_text(
         f"✅ Caption {'enabled' if enabled else 'disabled'} for {pair.get('name', pair['id'])}"
@@ -1532,10 +1655,25 @@ async def bot_setthumbnail(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     THUMBNAIL_DIR.mkdir(parents=True, exist_ok=True)
+    raw_path = THUMBNAIL_DIR / f".{pair['id']}_{uuid.uuid4().hex}.upload"
     path = THUMBNAIL_DIR / f"{pair['id']}.jpg"
     file_id = photo[-1].file_id if photo else document.file_id
-    tg_file = await context.bot.get_file(file_id)
-    await tg_file.download_to_drive(custom_path=str(path))
+    processed_path = None
+    try:
+        tg_file = await context.bot.get_file(file_id)
+        await tg_file.download_to_drive(custom_path=str(raw_path))
+        processed_path = _prepare_thumbnail(raw_path)
+        processed_path.replace(path)
+    except Exception as error:
+        await update.message.reply_text(f"❌ Thumbnail process nahi ho saka: {error}")
+        return
+    finally:
+        raw_path.unlink(missing_ok=True)
+        if processed_path and processed_path.exists() and processed_path != path:
+            processed_path.unlink(missing_ok=True)
+    old = pair.get("thumbnail_path")
+    if old and Path(old) != path:
+        Path(old).unlink(missing_ok=True)
     pair["thumbnail_path"] = str(path)
     pair["thumbnail_enabled"] = True
     save_state(state)
@@ -3012,6 +3150,10 @@ async def _create_pair(payload):
     target = parse_channel_input(str(payload.get("target", "")))
     if not source or not target:
         raise ValueError("Source and target are required")
+    caption_template = str(payload.get("caption_template", ""))
+    template_error = _caption_template_error(caption_template)
+    if template_error:
+        raise ValueError(template_error)
     src_entity, tgt_entity = await asyncio.gather(
         client.get_entity(source), client.get_entity(target)
     )
@@ -3045,7 +3187,7 @@ async def _create_pair(payload):
         "quiet_end": str(payload.get("quiet_end", "")),
         "protected_behavior": str(payload.get("protected_behavior", "download")),
         "caption_enabled": bool(payload.get("caption_enabled", False)),
-        "caption_template": str(payload.get("caption_template", "")),
+        "caption_template": caption_template,
         "caption_types": _normalise_types(payload.get("caption_types")),
         "caption_parse_mode": str(payload.get("caption_parse_mode", "md")),
         "thumbnail_enabled": bool(payload.get("thumbnail_enabled", False)),
@@ -3332,6 +3474,10 @@ def api_delete_pair(pair_id):
         if not pair:
             return jsonify({"ok": False, "error": "Pair not found"})
         payload = request.json or {}
+        if "caption_template" in payload:
+            template_error = _caption_template_error(str(payload.get("caption_template", "")))
+            if template_error:
+                return jsonify({"ok": False, "error": template_error}), 400
         for key in ("name", "rate_profile", "rate_delay", "max_messages",
                     "daily_message_limit", "daily_media_mb", "auto_forward",
                     "caption_prefix", "caption_suffix", "remove_links",
@@ -3388,10 +3534,20 @@ def api_pair_thumbnail(pair_id):
         return jsonify({"ok": False, "error": "Unsupported or invalid image file"}), 400
     if size > 20 * 1024 * 1024:
         return jsonify({"ok": False, "error": "Thumbnail must be 20 MB or smaller"}), 400
-    suffix = Path(upload.filename).suffix.lower() or ".jpg"
-    path = THUMBNAIL_DIR / f"{pair_id}{suffix}"
-    upload.save(path)
-    if old and old != str(path):
+    raw_path = THUMBNAIL_DIR / f".{pair_id}_{uuid.uuid4().hex}.upload"
+    path = THUMBNAIL_DIR / f"{pair_id}.jpg"
+    processed_path = None
+    try:
+        upload.save(raw_path)
+        processed_path = _prepare_thumbnail(raw_path)
+        processed_path.replace(path)
+    except Exception as error:
+        return jsonify({"ok": False, "error": f"Could not process thumbnail: {error}"}), 400
+    finally:
+        raw_path.unlink(missing_ok=True)
+        if processed_path and processed_path.exists() and processed_path != path:
+            processed_path.unlink(missing_ok=True)
+    if old and Path(old) != path:
         Path(old).unlink(missing_ok=True)
     pair["thumbnail_path"] = str(path)
     pair["thumbnail_enabled"] = True
@@ -3449,9 +3605,20 @@ def api_task_thumbnail(task_id):
         if size > 20 * 1024 * 1024:
             return jsonify({"ok": False, "error": "Thumbnail must be 20 MB or smaller"}), 400
         THUMBNAIL_DIR.mkdir(parents=True, exist_ok=True)
-        path = THUMBNAIL_DIR / f"task_{task_id}{Path(upload.filename).suffix.lower() or '.jpg'}"
-        upload.save(path)
-        if old and old != str(path):
+        raw_path = THUMBNAIL_DIR / f".task_{task_id}_{uuid.uuid4().hex}.upload"
+        path = THUMBNAIL_DIR / f"task_{task_id}.jpg"
+        processed_path = None
+        try:
+            upload.save(raw_path)
+            processed_path = _prepare_thumbnail(raw_path)
+            processed_path.replace(path)
+        except Exception as error:
+            return jsonify({"ok": False, "error": f"Could not process thumbnail: {error}"}), 400
+        finally:
+            raw_path.unlink(missing_ok=True)
+            if processed_path and processed_path.exists() and processed_path != path:
+                processed_path.unlink(missing_ok=True)
+        if old and Path(old) != path:
             Path(old).unlink(missing_ok=True)
         settings["thumbnail_path"] = str(path)
         settings["thumbnail_enabled"] = True
