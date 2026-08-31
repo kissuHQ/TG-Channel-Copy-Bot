@@ -2992,21 +2992,6 @@ async def auto_forward_handler(event):
         save_state(state)
 
 
-@client.on(events.MessageEdited)
-async def edit_sync_handler(event):
-    if not state.get("source") or event.chat_id != _telegram_chat_id(await client.get_entity(state["source"])):
-        return
-    message = event.message
-    mapping = state.get("message_map", {}).get("default", {}).get(str(message.id))
-    if not mapping or not state.get("target"):
-        return
-    try:
-        await client.edit_message(state["target"], mapping, text=message.text or "")
-        _log_live(f"✏️ Edited target message for source ID={message.id}")
-    except Exception as exc:
-        logger.warning("Edit sync failed for %s: %s", message.id, exc)
-
-
 def get_msg_type(message) -> str:
     if not message.media or isinstance(message.media, MessageMediaWebPage):
         return "text"
