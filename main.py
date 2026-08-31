@@ -18,6 +18,7 @@ import hmac
 import hashlib
 import re
 import csv
+import html
 import threading
 import tempfile
 import uuid
@@ -33,7 +34,7 @@ from flask import (
     Flask, Response, render_template, jsonify, request, session,
     redirect, url_for, stream_with_context,
 )
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, Button
 from telethon.network import ConnectionTcpAbridged
 from telethon.tl.types import (
     MessageMediaPhoto, MessageMediaDocument,
@@ -1077,6 +1078,391 @@ async def safe_reply(event, text):
         await event.reply(text)
 
 
+HELP_CATEGORIES = [
+    {
+        "slug": "setup",
+        "title": "🚀 Setup",
+        "summary": "Pehle source aur target set karo, phir current pair ko verify karo.",
+        "items": [
+            {
+                "commands": ["/start"],
+                "title": "Bot start karna",
+                "why": "Naye chat mein bot ko activate karke basic status aur help links dekhne ke liye.",
+                "usage": "/start",
+            },
+            {
+                "commands": ["/help", ".help"],
+                "title": "Help menu",
+                "why": "Commands ko category ke hisaab se dekhne ke liye. Kisi category par tap karo, phir Back se menu par aa jao.",
+                "usage": "/help  or  .help",
+            },
+            {
+                "commands": ["/setsource", ".setsource"],
+                "title": "Source channel set karna",
+                "why": "Jis channel se messages read karne hain usse set karta hai. Public username, channel ID, link, ya forwarded private message use kar sakte ho.",
+                "usage": "/setsource @source\n.setsource -1001234567890",
+            },
+            {
+                "commands": ["/settarget", ".settarget"],
+                "title": "Target channel set karna",
+                "why": "Jis channel mein copies upload hongi usse set karta hai. Private target ke liye us channel ka forwarded message bhi reply kar sakte ho.",
+                "usage": "/settarget @target\n.settarget -1001234567890",
+            },
+            {
+                "commands": ["/info", ".info"],
+                "title": "Current configuration dekhna",
+                "why": "Source, target, pairs aur important defaults check karo before a sync.",
+                "usage": "/info  or  .info",
+            },
+        ],
+    },
+    {
+        "slug": "sync",
+        "title": "🔄 Sync & Tasks",
+        "summary": "Bulk copy start, preview, pause, resume aur task queue manage karne ke tools.",
+        "items": [
+            {
+                "commands": ["/sync", ".sync"],
+                "title": "Full sync",
+                "why": "Source ke purane messages ko target mein copy karne ke liye. Pehle pair settings check kar lena.",
+                "usage": "/sync  or  .sync",
+            },
+            {
+                "commands": ["/force_sync"],
+                "title": "Limits ke bina full sync",
+                "why": "Normal daily message/media limits ko bypass karke full sync queue karta hai. Isse carefully use karo.",
+                "usage": "/force_sync",
+                "bot_only": True,
+            },
+            {
+                "commands": ["/syncfrom", ".syncfrom"],
+                "title": "Message ID se sync",
+                "why": "Source ke kisi specific message ID se aage copy karne ke liye, jab poora history dobara nahi chahiye.",
+                "usage": "/syncfrom 12345\n.syncfrom 12345",
+            },
+            {
+                "commands": ["/synclast", ".synclast"],
+                "title": "Last N messages",
+                "why": "Sirf recent messages ka quick test ya small catch-up karne ke liye.",
+                "usage": "/synclast 100\n.synclast 100",
+            },
+            {
+                "commands": ["/tasks"],
+                "title": "Task queue",
+                "why": "Queued, running aur completed sync tasks ka overview dekhne ke liye.",
+                "usage": "/tasks",
+                "bot_only": True,
+            },
+            {
+                "commands": ["/pause", ".pause"],
+                "title": "Pause",
+                "why": "Active transfer ko temporarily rokta hai; progress safe rehti hai aur baad mein resume kar sakte ho.",
+                "usage": "/pause  or  .pause",
+            },
+            {
+                "commands": ["/resume", ".resume"],
+                "title": "Resume",
+                "why": "Paused sync ko wahi se continue karne ke liye.",
+                "usage": "/resume  or  .resume",
+            },
+            {
+                "commands": ["/stop", ".stop"],
+                "title": "Stop",
+                "why": "Active sync ko cancel karne ke liye. Ye pause nahi hai; naya task baad mein dobara queue karna pad sakta hai.",
+                "usage": "/stop  or  .stop",
+            },
+            {
+                "commands": ["/refresh", ".refresh"],
+                "title": "New posts refresh",
+                "why": "Last synced message ke baad ke naye posts copy karne ke liye. Live auto-forward se alag, ye manual catch-up hai.",
+                "usage": "/refresh  or  .refresh",
+            },
+            {
+                "commands": ["Continue button"],
+                "title": "Continue",
+                "why": "Agar bot kisi confirmation ya resume action ke saath Continue button dikhaye, usse tap karke wahi task aage badhao.",
+                "usage": "Inline button: Continue",
+                "bot_only": True,
+            },
+        ],
+    },
+    {
+        "slug": "autoforward",
+        "title": "⚡ Auto-forward",
+        "summary": "Naye posts ko live aate hi copy karna, bina har baar manual sync start kiye.",
+        "items": [
+            {
+                "commands": ["/autoforward"],
+                "title": "Live auto-forward on/off",
+                "why": "Naye source posts ko turant automatically copy karne ke liye. Purane messages chahiye to pehle /sync chalao; auto-forward bulk history nahi laata.",
+                "usage": "/autoforward on\n/autoforward off",
+                "bot_only": True,
+            },
+        ],
+        "dashboard_note": "Dashboard ke Channel pairs page mein har pair ka auto-forward toggle bhi hai. Pair-level choice ko wahan se manage karo.",
+    },
+    {
+        "slug": "caption",
+        "title": "✏️ Caption & Thumbnail",
+        "summary": "Caption templates, Telegram formatting aur video thumbnails ko customize karo.",
+        "items": [
+            {
+                "commands": ["/caption"],
+                "title": "Caption changer",
+                "why": "Selected pair aur message types ke captions ko template se change karne ke liye. Blank template original caption behavior par wapas aa sakta hai.",
+                "usage": "/caption <pair_id> on|off [template]",
+                "bot_only": True,
+            },
+            {
+                "commands": ["/setthumbnail"],
+                "title": "Video thumbnail",
+                "why": "Replied photo/image ko pair ke videos ke thumbnail ke roop mein save karne ke liye.",
+                "usage": "Photo ko reply karke:\n/setthumbnail <pair_id>",
+                "bot_only": True,
+            },
+        ],
+        "dashboard_note": "Dashboard ke pair editor mein caption enable, message-type toggles, template, parse mode aur thumbnail upload available hain.",
+        "formatting": {
+            "intro": "Caption format dropdown mein md, html ya plain choose karo. Ye guide Telegram ke supported message entities par based hai; GitHub Markdown ko blindly copy mat karo.",
+            "modes": [
+                {
+                    "name": "Markdown (md)",
+                    "note": "Is bot ka md mode Telegram/Telethon Markdown flavor use karta hai. Bold aur italic ke liye simple markers use karo. Telegram Markdown GitHub Markdown nahi hai: headers (#), bullet lists aur reliable nested formatting supported nahi samjho. Underline aur strikethrough ke liye HTML mode safer hai.",
+                    "rows": [
+                        {"label": "Bold", "raw": "*bold*", "rendered": "bold"},
+                        {"label": "Italic", "raw": "_italic_", "rendered": "italic"},
+                        {"label": "Underline", "raw": "Not supported in legacy md", "rendered": "Use HTML: <u>underline</u>"},
+                        {"label": "Strikethrough", "raw": "Not supported in legacy md", "rendered": "Use HTML: <s>strike</s>"},
+                        {"label": "Inline code", "raw": "`config.json`", "rendered": "config.json (monospace)"},
+                        {"label": "Code block", "raw": "```\\ncopy()\\n```", "rendered": "copy() in a code block"},
+                        {"label": "Clickable text", "raw": "[Open channel](https://t.me/example)", "rendered": "Open channel (clickable)"},
+                        {"label": "Raw URL", "raw": "https://t.me/example", "rendered": "Telegram usually auto-links the URL"},
+                    ],
+                    "examples": [
+                        {"raw": "*{filename}*", "rendered": "lecture.mp4 in bold"},
+                        {"raw": "_Source:_ {source}", "rendered": "Source: followed by the channel name in italic label"},
+                        {"raw": "[Open post]({source})", "rendered": "Open post as clickable text (only if {source} is a URL)"},
+                    ],
+                },
+                {
+                    "name": "HTML",
+                    "note": "Sirf Telegram ke supported tags use karo. Text entities ko simple rakho aur <, >, & ko raw text mein escape karo. Headers aur arbitrary CSS/HTML tags render nahi honge.",
+                    "rows": [
+                        {"label": "Bold", "raw": "<b>bold</b>", "rendered": "bold"},
+                        {"label": "Italic", "raw": "<i>italic</i>", "rendered": "italic"},
+                        {"label": "Underline", "raw": "<u>underline</u>", "rendered": "underline"},
+                        {"label": "Strikethrough", "raw": "<s>strike</s>", "rendered": "strike"},
+                        {"label": "Inline code", "raw": "<code>config.json</code>", "rendered": "config.json (monospace)"},
+                        {"label": "Code block", "raw": "<pre>copy()\\nwait()</pre>", "rendered": "copy() and wait() in a code block"},
+                        {"label": "Clickable text", "raw": '<a href="https://t.me/example">Open channel</a>', "rendered": "Open channel (clickable)"},
+                        {"label": "Raw URL", "raw": "https://t.me/example", "rendered": "Telegram usually auto-links the URL"},
+                    ],
+                    "examples": [
+                        {"raw": "<b>{filename}</b>", "rendered": "lecture.mp4 in bold"},
+                        {"raw": "<i>Source:</i> {source}", "rendered": "Source: as an italic label, then the channel name"},
+                        {"raw": '<a href="{source}">Open post</a>', "rendered": "Open post as clickable text (only if {source} is a URL)"},
+                    ],
+                },
+            ],
+            "line_breaks": "Line break ke liye actual newline bhejo. Ek blank line se paragraph-style gap dikhega; Markdown mein extra spaces ya GitHub-style paragraph rules par depend mat karo. Caption mein source text ke *, _, [, < ya & characters parse error de sakte hain, isliye template ko simple rakho.",
+            "template_note": "Template placeholders normal text ki tarah expand hote hain. Markdown mein *{filename}* aur HTML mein <b>{filename}</b> filename ko bold banayega. Placeholder value khud user input ho sakti hai, isliye unusual characters ke saath plain mode ya carefully escaped formatting use karo.",
+            "plain_note": "caption_parse_mode=plain tab use karo jab source captions mein raw *, _, [, < ya & jaise characters hon, ya tumhe koi formatting nahi chahiye. Plain mode safest hai: caption as-is bheja jaata hai, formatting apply nahi hoti.",
+        },
+    },
+    {
+        "slug": "limits",
+        "title": "⚙️ Limits, Schedule & Status",
+        "summary": "Transfer ki speed, safety limits aur current runtime state samjho.",
+        "items": [
+            {
+                "commands": ["/status", ".status"],
+                "title": "Live status",
+                "why": "Current task, progress, pause state aur recent counters dekhne ke liye.",
+                "usage": "/status  or  .status",
+            },
+            {
+                "commands": ["/reset", ".reset"],
+                "title": "Config reset",
+                "why": "Legacy default source/target aur runtime configuration ko reset karne ke liye. Pair data delete karne se pehle dashboard mein carefully check karo.",
+                "usage": "/reset  or  .reset",
+            },
+        ],
+        "dashboard_note": "Pair settings mein daily message limit, daily media limit, rate profile/custom delay, maximum posts per hour, schedule window aur quiet hours milte hain. Ye controls flood risk aur unwanted timing ko manage karte hain; 0 hourly cap ka matlab no extra hourly cap hai.",
+    },
+    {
+        "slug": "dashboard",
+        "title": "🌐 Dashboard-only features",
+        "summary": "Web dashboard mein detailed editing, previews aur operational controls milte hain.",
+        "items": [
+            {
+                "commands": ["Dashboard"],
+                "title": "Dashboard kaise kholen",
+                "why": "Login ke baad /dashboard par overview milta hai. Sidebar se Tasks, Channel pairs, Global settings aur Help pages switch karo.",
+                "usage": "Dashboard URL → login → /dashboard",
+            },
+        ],
+        "features": [
+            ("Channel pairs", "Pair create, edit aur delete karo; source/target ke saath pair name, include/exclude keywords aur allowed message types set karo."),
+            ("Transfer safety", "Rate profile/custom delay, per-run maximum messages, daily message/media limits, maximum posts per hour, schedule window, quiet hours aur protected-content behavior configure karo."),
+            ("Caption & media", "Caption template, caption enable switch, Text/Photo/Video/Document/Other toggles, Markdown/HTML/Plain parse mode aur video thumbnail upload manage karo."),
+            ("Dry-run preview", "Task create karne se pehle estimated messages, filtered/duplicate count, media size aur approximate time preview karo."),
+            ("Task operations", "Task priority choose karo aur queue mein multiple tasks ko bulk pause/resume/stop/delete actions ke saath manage karo."),
+            ("Notifications", "Global settings mein task complete, task failed aur FloodWait/limit warning notifications toggle karo."),
+            ("Storage cleanup", "Dashboard se leftover temporary downloaded files clean karo jab storage snapshot mein space reclaim karna ho."),
+        ],
+        "dashboard_note": "Ye controls bot commands se nahi milte. Dashboard ke Help page par har field ka short explanation bhi available hai.",
+    },
+]
+
+HELP_CATEGORY_BY_SLUG = {category["slug"]: category for category in HELP_CATEGORIES}
+
+
+def _help_commands(item):
+    return " / ".join(item.get("commands", []))
+
+
+def _help_category_keyboard(telethon=False):
+    if telethon:
+        return [[Button.inline(category["title"], data=f"help:{category['slug']}")] for category in HELP_CATEGORIES]
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(category["title"], callback_data=f"help:{category['slug']}")]
+        for category in HELP_CATEGORIES
+    ])
+
+
+def _bot_help_index_text():
+    return (
+        "<b>🤖 Archive Bot Help</b>\n\n"
+        "Pehle <code>/setsource</code> aur <code>/settarget</code> se route set karo, "
+        "phir <code>/sync</code> se purane messages copy karo.\n"
+        "Naye posts ke liye <code>/autoforward on</code> use karo.\n"
+        "Neeche category choose karke command ka when/why dekho."
+    )
+
+
+def _bot_help_category_text(category):
+    lines = [f"<b>{html.escape(category['title'])}</b>", html.escape(category["summary"]), ""]
+    for item in category.get("items", []):
+        commands = html.escape(_help_commands(item))
+        lines.extend([
+            f"<b>{html.escape(item['title'])}</b> · <code>{commands}</code>",
+            html.escape(item["why"]),
+            f"<code>{html.escape(item['usage'])}</code>",
+            "",
+        ])
+    if category.get("dashboard_note"):
+        lines.extend(["<b>Dashboard note</b>", html.escape(category["dashboard_note"]), ""])
+    if category.get("features"):
+        lines.extend(["<b>Dashboard mein kya milega</b>"])
+        for title, body in category["features"]:
+            lines.append(f"• <b>{html.escape(title)}</b> — {html.escape(body)}")
+        lines.append("")
+    if category.get("formatting"):
+        guide = category["formatting"]
+        lines.extend([
+            "<b>Formatting guide</b>",
+            "md aur html ke Telegram-supported examples:",
+            "",
+        ])
+        for mode in guide["modes"]:
+            if mode["name"].startswith("Markdown"):
+                bot_note = (
+                    "md mein *bold*, _italic_, `code`, ```code block``` aur "
+                    "[clickable text](URL) use karo. Underline/strike ke liye "
+                    "HTML mode choose karo. # headers, bullet lists aur GitHub-style "
+                    "nested formatting Telegram md mein nahi hai."
+                )
+            else:
+                bot_note = (
+                    "HTML mein sirf supported tags use karo: <b>, <i>, <u>, <s>, "
+                    "<code>, <pre> aur <a href=\"URL\">text</a>. Raw <, >, & ko "
+                    "escape karo; CSS/arbitrary HTML render nahi hoga."
+                )
+            lines.extend([f"<b>{html.escape(mode['name'])}</b>", html.escape(bot_note)])
+            for row in mode["rows"]:
+                lines.append(
+                    f"• <b>{html.escape(row['label'])}</b> "
+                    f"<code>{html.escape(row['raw'])}</code> → {html.escape(row['rendered'])}"
+                )
+            for example in mode["examples"]:
+                lines.append(
+                    f"• <code>{html.escape(example['raw'])}</code> → "
+                    f"{html.escape(example['rendered'])}"
+                )
+            lines.append("")
+        lines.extend([
+            "<b>Line breaks</b>\nActual newline use karo; blank line paragraph gap deta hai. "
+            "GitHub headers/lists par depend mat karo. Raw *, _, [, &amp; ya &lt; parse error de sakte hain.",
+            "<b>Template placeholders</b>\n"
+            "md: <code>*{filename}*</code> · html: <code>&lt;b&gt;{filename}&lt;/b&gt;</code>. "
+            "Placeholder values unusual hon to carefully escape karo.",
+            "<b>Plain text</b>\n"
+            "<code>caption_parse_mode=plain</code> safest hai jab source mein formatting "
+            "characters hon ya koi formatting nahi chahiye.",
+        ])
+    return "\n".join(lines).strip()
+
+
+def _userbot_help_index_text():
+    return (
+        "🤖 Archive Bot Help\n\n"
+        "Pehle .setsource aur .settarget se route set karo, "
+        "phir .sync se purane messages copy karo.\n"
+        "Naye posts ke liye bot mein /autoforward on use karo.\n"
+        "Category choose karo:"
+    )
+
+
+def _userbot_help_category_text(category):
+    lines = [category["title"], category["summary"], ""]
+    for item in category.get("items", []):
+        commands = _help_commands(item)
+        lines.extend([
+            f"{item['title']} · {commands}",
+            item["why"],
+            f"Use: {item['usage']}",
+            "",
+        ])
+    if category.get("dashboard_note"):
+        lines.extend(["Dashboard note:", category["dashboard_note"], ""])
+    if category.get("features"):
+        lines.append("Dashboard mein:")
+        for title, body in category["features"]:
+            lines.append(f"• {title} — {body}")
+        lines.append("")
+    if category.get("formatting"):
+        guide = category["formatting"]
+        lines.extend(["Formatting guide", guide["intro"], ""])
+        for mode in guide["modes"]:
+            lines.extend([mode["name"], mode["note"]])
+            for row in mode["rows"]:
+                lines.append(f"• {row['label']}: {row['raw']} → {row['rendered']}")
+            lines.append("Examples:")
+            for example in mode["examples"]:
+                lines.append(f"• {example['raw']} → {example['rendered']}")
+            lines.append("")
+        lines.extend([
+            f"Line breaks: {guide['line_breaks']}",
+            f"Template placeholders: {guide['template_note']}",
+            f"Plain text: {guide['plain_note']}",
+        ])
+    return "\n".join(lines).strip()
+
+
+def _bot_help_markup(category=None):
+    if category is None:
+        return _help_category_keyboard()
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Back to categories", callback_data="help:back")]
+    ])
+
+
+def _userbot_help_markup(category=None):
+    if category is None:
+        return _help_category_keyboard(telethon=True)
+    return [[Button.inline("⬅️ Back to categories", data=b"help:back")]]
+
+
 # ════════════════════════════════════════════════════════
 #  USERBOT COMMANDS (outgoing messages with dot prefix)
 # ════════════════════════════════════════════════════════
@@ -1086,24 +1472,32 @@ async def cmd_help(event):
     if not is_owner(event.sender_id):
         return
     await event.edit(
-        "🤖 **Archive Bot Commands**\n\n"
-        "`.setsource @user / -100id / link` — Source set karo\n"
-        "`.setsource` (forwarded msg pe reply) — Private channel source set\n"
-        "`.settarget @user / -100id / link` — Target set karo\n"
-        "`.settarget` (forwarded msg pe reply) — Private channel target set\n"
-        "`.info` — Current config dekho\n"
-        "`.sync` — Full sync start karo (sab messages)\n"
-        "`.syncfrom <id>` — Specific message ID se sync karo\n"
-        "`.synclast <n>` — Last N messages sync karo\n"
-        "`.pause` — Sync pause karo\n"
-        "`.resume` — Sync resume karo\n"
-        "`.stop` — Sync stop karo\n"
-        "`.status` — Live status dekho\n"
-        "`.refresh` — Source refresh karke naye posts copy karo\n"
-        "`.reset` — Config reset karo\n"
-        "`.help` — Ye menu\n\n"
-        "⚠️ Sirf owner (tum) use kar sakte ho"
+        _userbot_help_index_text(),
+        buttons=_userbot_help_markup(),
     )
+
+
+@client.on(events.CallbackQuery(data=re.compile(br"^help:")))
+async def cmd_help_callback(event):
+    if not is_owner(event.sender_id):
+        await event.answer("❌ Sirf owner use kar sakta hai.", alert=True)
+        return
+    value = event.data.decode("utf-8", errors="ignore")
+    if value == "help:back":
+        await event.edit(
+            _userbot_help_index_text(),
+            buttons=_userbot_help_markup(),
+        )
+    else:
+        category = HELP_CATEGORY_BY_SLUG.get(value.split(":", 1)[1])
+        if not category:
+            await event.answer("Help category nahi mili.", alert=True)
+            return
+        await event.edit(
+            _userbot_help_category_text(category),
+            buttons=_userbot_help_markup(category),
+        )
+    await event.answer()
 
 
 def parse_channel_input(text):
@@ -1556,30 +1950,35 @@ async def bot_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not bot_is_owner(update):
         return
     await update.message.reply_text(
-        "<b>🤖 Bot Commands:</b>\n\n"
-        "<code>/setsource @user / -100id / link</code> — Source set karo\n"
-        "/setsource (msg forward karke) — Private channel source set\n"
-        "<code>/settarget @user / -100id / link</code> — Target set karo\n"
-        "/settarget (msg forward karke) — Private channel target set\n"
-        "<code>/info</code> — Current config dekho\n"
-        "<code>/sync</code> — Full sync start karo\n"
-        "<code>/force_sync</code> — Full sync, daily limits ke bina\n"
-        "<code>/syncfrom &lt;id&gt;</code> — Message ID se sync karo\n"
-        "<code>/synclast &lt;n&gt;</code> — Last N messages sync karo\n"
-        "<code>/tasks</code> — Queue ke tasks dekho\n"
-        "<code>/autoforward on|off</code> — New posts automatically copy karo\n"
-        "<code>/caption &lt;pair_id&gt; on|off [template]</code> — Caption rules set karo\n"
-        "Caption placeholders: {caption} {filename} {filesize} {filesize_mb} {message_id} "
-        "{source} {date} {time} {mime} {type} {duration} {resolution}\n"
-        "<code>/setthumbnail &lt;pair_id&gt;</code> — Photo/image ko reply karke thumbnail set karo\n"
-        "<code>/pause</code> — Sync pause karo\n"
-        "<code>/resume</code> — Sync resume karo\n"
-        "<code>/stop</code> — Sync stop karo\n"
-        "<code>/status</code> — Live status dekho\n"
-        "<code>/refresh</code> — Source refresh karke naye posts copy karo\n"
-        "<code>/reset</code> — Config reset karo\n\n"
-        "⚠️ Sirf owner use kar sakta hai",
-        parse_mode="HTML"
+        _bot_help_index_text(),
+        parse_mode="HTML",
+        reply_markup=_bot_help_markup(),
+    )
+
+
+async def bot_help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    if not bot_is_owner(update):
+        await query.answer("❌ Sirf owner use kar sakta hai.", show_alert=True)
+        return
+    await query.answer()
+    if query.data == "help:back":
+        await query.edit_message_text(
+            _bot_help_index_text(),
+            parse_mode="HTML",
+            reply_markup=_bot_help_markup(),
+        )
+        return
+    category = HELP_CATEGORY_BY_SLUG.get(query.data.split(":", 1)[1])
+    if not category:
+        await query.answer("Help category nahi mili.", show_alert=True)
+        return
+    await query.edit_message_text(
+        _bot_help_category_text(category),
+        parse_mode="HTML",
+        reply_markup=_bot_help_markup(category),
     )
 
 
@@ -3287,6 +3686,11 @@ def settings_page():
     return render_template("settings.html", active_page="settings")
 
 
+@flask_app.route("/help")
+def help_page():
+    return render_template("help.html", active_page="help", help_categories=HELP_CATEGORIES)
+
+
 @flask_app.route("/favicon.ico")
 def favicon():
     return Response(status=204)
@@ -4028,6 +4432,7 @@ async def main():
     app.add_handler(CommandHandler("autoforward", bot_autoforward))
     app.add_handler(CommandHandler("caption", bot_caption))
     app.add_handler(CommandHandler("setthumbnail", bot_setthumbnail))
+    app.add_handler(CallbackQueryHandler(bot_help_callback, pattern=r"^help:"))
     app.add_handler(CallbackQueryHandler(bot_continue_callback, pattern=r"^continue:"))
 
     print("🤖 Telegram Bot started! Commands available via bot.")

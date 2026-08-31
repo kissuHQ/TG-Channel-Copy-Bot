@@ -1,0 +1,90 @@
+{% extends "base.html" %}
+{% block title %}Help · Archive Bot{% endblock %}
+{% block crumb %}Help{% endblock %}
+{% block content %}
+<section class="page-heading">
+  <div>
+    <p class="eyebrow">Reference guide</p>
+    <h1>Help center</h1>
+    <p class="lede">Commands, dashboard controls, and caption formatting in the same six categories you see in Telegram.</p>
+  </div>
+</section>
+
+<section class="help-category-grid" aria-label="Help categories">
+  {% for category in help_categories %}
+  <a class="help-category-card" href="#help-{{ category.slug }}">
+    <span class="help-category-icon">{{ category.title.split(' ', 1)[0] }}</span>
+    <span><strong>{{ category.title.split(' ', 1)[1] }}</strong><small>{{ category.summary }}</small></span>
+    <span class="help-category-arrow">↓</span>
+  </a>
+  {% endfor %}
+</section>
+
+<section class="help-sections">
+  {% for category in help_categories %}
+  <details class="surface help-section" id="help-{{ category.slug }}" {% if loop.first %}open{% endif %}>
+    <summary>
+      <span class="help-summary-title"><span class="help-summary-icon">{{ category.title.split(' ', 1)[0] }}</span><span><strong>{{ category.title.split(' ', 1)[1] }}</strong><small>{{ category.summary }}</small></span></span>
+      <span class="help-summary-toggle">Expand</span>
+    </summary>
+    <div class="help-section-body">
+      {% for item in category['items'] %}
+      <article class="help-item">
+        <div class="help-item-heading">
+          <div><h3>{{ item.title }}</h3><div class="help-command-list">{% for command in item.commands %}<code>{{ command }}</code>{% endfor %}</div></div>
+          {% if item.bot_only %}<span class="help-tag">Bot only</span>{% endif %}
+        </div>
+        <p>{{ item.why }}</p>
+        <pre class="help-usage">{{ item.usage }}</pre>
+      </article>
+      {% endfor %}
+
+      {% if category.dashboard_note %}
+      <div class="help-callout"><strong>Dashboard note</strong><p>{{ category.dashboard_note }}</p></div>
+      {% endif %}
+
+      {% if category.features %}
+      <div class="help-feature-grid">
+        {% for title, body in category.features %}
+        <article class="help-feature"><strong>{{ title }}</strong><p>{{ body }}</p></article>
+        {% endfor %}
+      </div>
+      {% endif %}
+
+      {% if category.formatting %}
+      <div class="formatting-guide">
+        <div class="help-subheading"><p class="eyebrow">Caption editor</p><h3>Markdown & HTML formatting</h3><p>{{ category.formatting.intro }}</p></div>
+        {% for mode in category.formatting.modes %}
+        <section class="formatting-mode">
+          <div class="formatting-mode-heading"><h4>{{ mode.name }}</h4><p>{{ mode.note }}</p></div>
+          <div class="formatting-table-wrap">
+            <table class="formatting-table">
+              <thead><tr><th>What</th><th>Raw input</th><th>Telegram renders</th></tr></thead>
+              <tbody>
+              {% for row in mode.rows %}
+              <tr><td>{{ row.label }}</td><td><code>{{ row.raw }}</code></td><td>{{ row.rendered }}</td></tr>
+              {% endfor %}
+              </tbody>
+            </table>
+          </div>
+          <div class="formatting-examples">
+            <strong>Worked examples</strong>
+            {% for example in mode.examples %}
+            <div><code>{{ example.raw }}</code><span>→</span><span>{{ example.rendered }}</span></div>
+            {% endfor %}
+          </div>
+        </section>
+        {% endfor %}
+        <div class="help-note-grid">
+          <article><strong>Line breaks & paragraphs</strong><p>{{ category.formatting.line_breaks }}</p></article>
+          <article><strong>Template placeholders</strong><p>{{ category.formatting.template_note }}</p></article>
+          <article><strong>Plain text mode</strong><p>{{ category.formatting.plain_note }}</p></article>
+        </div>
+      </div>
+      {% endif %}
+    </div>
+  </details>
+  {% endfor %}
+</section>
+{% endblock %}
+{% block scripts %}<script>window.PAGE = 'help';</script>{% endblock %}
