@@ -3809,6 +3809,12 @@ def api_task_control(task_id):
             ok, message = _resume_paused_task(task)
             return jsonify({"ok": ok, "message": message, "task": _task_view(task)})
         if isinstance(payload.get("settings"), dict):
+            if "caption_template" in payload["settings"]:
+                template_error = _caption_template_error(
+                    str(payload["settings"].get("caption_template", ""))
+                )
+                if template_error:
+                    return jsonify({"ok": False, "error": template_error}), 400
             settings = dict(task.get("task_settings") or _pair_config(_pair_by_id(task.get("pair_id"))))
             editable = {
                 "include_keywords", "exclude_keywords", "caption_prefix", "caption_suffix",
