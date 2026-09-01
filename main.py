@@ -2537,6 +2537,7 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
 
         async def wait_for_bulk_limits():
             """Wait for recurring pair windows without pausing the task."""
+            nonlocal control
             wait_reason = None
             while True:
                 control = state.get("task_controls", {}).get(task_id or "legacy", control)
