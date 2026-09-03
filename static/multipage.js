@@ -1,5 +1,5 @@
 const page = window.PAGE || 'dashboard';
-let appData = { status: {}, pairs: [], tasks: [] };
+let appData = { status: {}, pairs: [], batches: [], tasks: [] };
 
 function esc(value) {
   return String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[char]));
@@ -53,25 +53,28 @@ function applyData(payload) {
     appData.status = payload.status;
     appData.tasks = payload.status.tasks || appData.tasks;
     appData.pairs = payload.status.pairs || appData.pairs;
+    appData.batches = payload.status.batches || appData.batches;
     renderConnection(payload.status);
     if (page === 'dashboard') renderDashboard();
     if (page === 'tasks') renderTaskPage();
     if (page === 'task-detail') renderTaskDetail();
   }
   if (payload.pairs) { appData.pairs = payload.pairs; if (page === 'pairs' || page === 'tasks') renderPageLists(); }
+  if (payload.batches) { appData.batches = payload.batches; if (page === 'pairs' || page === 'tasks') renderPageLists(); }
 }
 async function loadAppData() {
   try {
-    const [bootstrap, pairs, tasks] = await Promise.all([
-      request('/api/bootstrap'), request('/api/pairs'), request('/api/tasks')
+    const [bootstrap, pairs, batches, tasks] = await Promise.all([
+      request('/api/bootstrap'), request('/api/pairs'), request('/api/batches'), request('/api/tasks')
     ]);
-    if (!bootstrap.ok || !pairs.ok || !tasks.ok) {
-      throw new Error(bootstrap.error || pairs.error || tasks.error || 'Could not load workspace data');
+    if (!bootstrap.ok || !pairs.ok || !batches.ok || !tasks.ok) {
+      throw new Error(bootstrap.error || pairs.error || batches.error || tasks.error || 'Could not load workspace data');
     }
     appData.status = bootstrap.status || {};
     appData.tasks = tasks.tasks || appData.status.tasks || [];
     appData.pairs = pairs.pairs || appData.status.pairs || [];
-    applyData({status:appData.status, pairs:appData.pairs});
+    appData.batches = batches.batches || pairs.batches || appData.status.batches || [];
+    applyData({status:appData.status, pairs:appData.pairs, batches:appData.batches});
     renderPageLists();
     if (page === 'settings') await loadSettings();
     if (page === 'task-detail') renderTaskDetail();
@@ -101,22 +104,31 @@ function renderDashboard() {
 }
 function renderPageLists() { if (page === 'dashboard') renderDashboard(); if (page === 'tasks') renderTaskPage(); if (page === 'pairs') renderPairPage(); }
 function renderTaskPairOptions() {
-  const select = document.getElementById('task-pair');
-  if (!select) return;
-  const selected = select.value;
+  const list = document.getElementById('task-pair-list');
+  if (!list) return;
   const pairs = Array.isArray(appData.pairs) ? appData.pairs : [];
+  const selected = new Set([...list.querySelectorAll('.task-pair:checked')].map(input => input.value));
   if (!pairs.length) {
-    select.innerHTML = '<option value="" disabled selected>No pairs</option>';
+    list.innerHTML = '<div class="empty-state">No channel routes. Add routes from Channel batches first.</div>';
     return;
   }
-  select.innerHTML = pairs.map(pair => {
-    const name = String(pair.name || '').trim();
+  const batches = Array.isArray(appData.batches) ? appData.batches : [];
+  const grouped = batches.map(batch => ({
+    batch,
+    pairs: pairs.filter(pair => String(pair.batch_id || 'default') === String(batch.id))
+  })).filter(group => group.pairs.length);
+  const known = new Set(grouped.flatMap(group => group.pairs.map(pair => String(pair.id))));
+  if (pairs.some(pair => !known.has(String(pair.id)))) {
+    grouped.push({
+      batch: {id:'unassigned', name:'Unassigned routes'},
+      pairs: pairs.filter(pair => !known.has(String(pair.id)))
+    });
+  }
+  list.innerHTML = grouped.map(group => `<div class="task-batch-group"><div class="task-batch-heading"><strong>${esc(group.batch.name)}</strong><small>${group.pairs.length} route${group.pairs.length === 1 ? '' : 's'}</small></div>${group.pairs.map(pair => {
     const source = pair.source_title || pair.source || 'Source';
     const target = pair.target_title || pair.target || 'Target';
-    const label = name || `${source} → ${target}`;
-    return `<option value="${esc(pair.id)}">${esc(label)}</option>`;
-  }).join('');
-  if (pairs.some(pair => String(pair.id) === selected)) select.value = selected;
+    return `<label class="task-pair-option"><input class="task-pair" type="checkbox" value="${esc(pair.id)}" ${selected.has(String(pair.id)) ? 'checked' : ''}><span><strong>${esc(pair.name || `${source} → ${target}`)}</strong><small>${esc(source)} → ${esc(target)}</small></span><em>${pair.auto_forward ? 'Auto' : 'Manual'}</em></label>`;
+  }).join('')}</div>`).join('');
 }
 function renderTaskPage() {
   renderTaskPairOptions();
@@ -125,10 +137,13 @@ function renderTaskPage() {
   const tasks = appData.tasks.filter(task => filter === 'all' || task.status === filter).slice().reverse();
   list.innerHTML = tasks.length ? tasks.map(task => `<article class="task-card"><div class="task-card-top"><div><label><input class="task-check" type="checkbox" value="${esc(task.id)}"> <span class="muted">Select</span></label><h3>${esc(task.id)}</h3><div class="task-card-route">${esc(task.source || 'Source')} → ${esc(task.target || 'Target')}</div></div>${statusPill(task.status)}</div><div class="task-card-meta">${esc(task.mode || 'sync')} · ${esc(task.priority || 'normal')} priority · ${statsTotal(task)} copied · ${task.stats?.failed || 0} failed</div>${task.status === 'paused' ? `<div class="notice warning" style="margin-top:10px">${esc(task.pause_reason || 'A temporary limit paused this task')}</div>` : ''}<div class="task-card-actions"><a class="button small secondary" href="/tasks/${encodeURIComponent(task.id)}">Open task</a>${task.status === 'paused' ? `<button class="button small primary" onclick="continueTask('${esc(task.id)}')">Continue</button>` : ''}${task.status === 'running' ? `<button class="button small secondary" onclick="pauseTask('${esc(task.id)}')">Pause</button>` : ''}</div></article>`).join('') : '<div class="empty-state tasks-empty">No tasks match this filter.</div>';
 }
+function selectedTaskPairIds() {
+  return [...document.querySelectorAll('.task-pair:checked')].map(input => input.value);
+}
 async function createTaskFromPage() {
-  const pairId = document.getElementById('task-pair')?.value, mode = document.getElementById('task-mode')?.value, value = Number(document.getElementById('task-limit')?.value || 0);
-  if (!pairId) return toast('Choose a channel pair first', true);
-  const payload = {pair_ids:[pairId], mode, priority:document.getElementById('task-priority').value, limit:mode === 'last' ? value : 0, min_id:mode === 'from_id' ? value : 0};
+  const pairIds = selectedTaskPairIds(), mode = document.getElementById('task-mode')?.value, value = Number(document.getElementById('task-limit')?.value || 0);
+  if (!pairIds.length) return toast('Select at least one channel route', true);
+  const payload = {pair_ids:pairIds, mode, priority:document.getElementById('task-priority').value, limit:mode === 'last' ? value : 0, min_id:mode === 'from_id' ? value : 0};
   let result = await request('/api/tasks', {method:'POST', body:JSON.stringify(payload)});
   if (!result.ok && result.code === 'duplicate' &&
       confirm('A similar task is already queued or running. Queue another copy anyway?')) {
@@ -137,9 +152,9 @@ async function createTaskFromPage() {
   toast(result.ok ? 'Task added to the queue' : result.error, !result.ok); if (result.ok) { await loadAppData(); }
 }
 async function runDryPage() {
-  const pairId = document.getElementById('task-pair')?.value, mode = document.getElementById('task-mode')?.value, value = Number(document.getElementById('task-limit')?.value || 0);
-  if (!pairId) return toast('Choose a channel pair first', true);
-  const result = await request('/api/tasks/dry-run', {method:'POST', body:JSON.stringify({pair_ids:[pairId], mode, value})});
+  const pairIds = selectedTaskPairIds(), mode = document.getElementById('task-mode')?.value, value = Number(document.getElementById('task-limit')?.value || 0);
+  if (!pairIds.length) return toast('Select at least one channel route', true);
+  const result = await request('/api/tasks/dry-run', {method:'POST', body:JSON.stringify({pair_ids:pairIds, mode, value})});
   const node = document.getElementById('task-dry-run'); if (!node) return;
   node.classList.remove('hidden'); node.innerHTML = result.ok ? result.reports.map(r => `${esc(r.pair)}: ${r.allowed_messages} messages allowed, about ${Math.ceil(r.approximate_seconds / 60)} min`).join('<br>') : esc(result.error);
 }
@@ -180,16 +195,47 @@ function renderCaptionPreview() {
   const rendered = template ? template.replace(/\{([a-zA-Z_][a-zA-Z0-9_]*)\}/g, (match, key) => captionPreviewValues[key] ?? match) : 'Your rendered caption will appear here.';
   preview.innerHTML = `<small>Live preview</small><div>${esc(rendered)}</div>`;
 }
+function renderBatchOptions(selected = '') {
+  const select = document.getElementById('pair-batch'); if (!select) return;
+  const batches = Array.isArray(appData.batches) ? appData.batches : [];
+  select.innerHTML = batches.length ? batches.map(batch => `<option value="${esc(batch.id)}">${esc(batch.name)}</option>`).join('') : '<option value="default">Default batch</option>';
+  if (batches.some(batch => String(batch.id) === String(selected))) select.value = selected;
+}
 function renderPairPage() {
   const list = document.getElementById('page-pair-list'); if (!list) return;
-  document.getElementById('pair-count').textContent = `${appData.pairs.length} pair${appData.pairs.length === 1 ? '' : 's'}`;
-  list.innerHTML = appData.pairs.length ? appData.pairs.map(pair => `<article class="pair-card"><div class="pair-card-top"><h3>${esc(pair.name)}</h3><span class="status-pill neutral">${pair.auto_forward ? 'Auto-forward' : 'Manual'}</span></div><div class="pair-route">${esc(pair.source_title || pair.source)} → ${esc(pair.target_title || pair.target)}</div><div class="pair-meta">${pair.caption_enabled ? 'Custom captions' : 'Original captions'} · ${pair.thumbnail_enabled ? 'Thumbnails on' : 'Thumbnails off'} · ${pair.rate_delay || 3}s delay</div><div class="pair-card-actions"><button class="button small secondary" onclick="editPairPage('${esc(pair.id)}')">Edit pair</button><button class="button small secondary" onclick="copyPairAgain('${esc(pair.id)}')">Copy again</button><button class="button small secondary" onclick="deletePairPage('${esc(pair.id)}')">Delete</button></div></article>`).join('') : '<div class="empty-state">No pairs yet. Create your first route.</div>';
+  renderBatchOptions(document.getElementById('pair-batch')?.value || 'default');
+  document.getElementById('pair-count').textContent = `${appData.pairs.length} route${appData.pairs.length === 1 ? '' : 's'} · ${appData.batches.length} batch${appData.batches.length === 1 ? '' : 'es'}`;
+  const groups = appData.batches.map(batch => ({
+    batch,
+    pairs: appData.pairs.filter(pair => String(pair.batch_id || 'default') === String(batch.id))
+  }));
+  const groupedIds = new Set(groups.flatMap(group => group.pairs.map(pair => String(pair.id))));
+  const unassigned = appData.pairs.filter(pair => !groupedIds.has(String(pair.id)));
+  if (unassigned.length) groups.push({batch:{id:'unassigned', name:'Unassigned routes', auto_forward:false}, pairs:unassigned});
+  list.innerHTML = groups.length ? groups.map(group => `<section class="batch-section"><div class="batch-section-header"><div><span class="eyebrow">Channel batch</span><h3>${esc(group.batch.name)}</h3><small>${group.pairs.length} route${group.pairs.length === 1 ? '' : 's'} · ${group.batch.source_count || new Set(group.pairs.map(pair => String(pair.source))).size} source${(group.batch.source_count || new Set(group.pairs.map(pair => String(pair.source))).size) === 1 ? '' : 's'} → ${group.batch.target_count || new Set(group.pairs.map(pair => String(pair.target))).size} target${(group.batch.target_count || new Set(group.pairs.map(pair => String(pair.target))).size) === 1 ? '' : 's'}</small></div>${group.batch.id === 'unassigned' ? '' : `<button class="toggle-button ${group.batch.auto_forward ? 'on' : ''}" onclick="toggleBatchAutoforward('${esc(group.batch.id)}', ${!group.batch.auto_forward})">${group.batch.auto_forward ? 'Auto-forward on' : 'Auto-forward off'}</button>`}</div><div class="batch-route-list">${group.pairs.length ? group.pairs.map(pair => `<article class="pair-card"><div class="pair-card-top"><h4>${esc(pair.name || 'Unnamed route')}</h4><button class="toggle-button compact ${pair.auto_forward ? 'on' : ''}" onclick="togglePairAutoforward('${esc(pair.id)}', ${!pair.auto_forward})">${pair.auto_forward ? 'Route auto on' : 'Route auto off'}</button></div><div class="pair-route">${esc(pair.source_title || pair.source)} <span>→</span> ${esc(pair.target_title || pair.target)}</div><div class="pair-meta">${pair.caption_enabled ? 'Custom captions' : 'Original captions'} · ${pair.thumbnail_enabled ? 'Thumbnails on' : 'Thumbnails off'} · ${pair.rate_delay || 3}s delay</div><div class="pair-card-actions"><button class="button small secondary" onclick="editPairPage('${esc(pair.id)}')">Edit route</button><button class="button small secondary" onclick="copyPairAgain('${esc(pair.id)}')">Copy again</button><button class="button small secondary" onclick="deletePairPage('${esc(pair.id)}')">Delete</button></div></article>`).join('') : '<div class="empty-state">No routes in this batch yet. Add a route below.</div>'}</div></section>`).join('') : '<div class="empty-state">No batches yet. Create a batch and add your first route.</div>';
+}
+async function createBatchPage() {
+  const input = document.getElementById('batch-name'), name = input?.value.trim();
+  if (!name) return toast('Enter a batch name first', true);
+  const result = await request('/api/batches', {method:'POST', body:JSON.stringify({name})});
+  toast(result.ok ? 'Batch created' : result.error, !result.ok);
+  if (result.ok) { input.value = ''; await loadAppData(); document.getElementById('pair-batch').value = result.batch.id; location.hash = 'pair-editor'; }
+}
+async function toggleBatchAutoforward(id, enabled) {
+  const result = await request(`/api/batches/${encodeURIComponent(id)}`, {method:'PATCH', body:JSON.stringify({auto_forward:enabled})});
+  toast(result.ok ? `Batch auto-forward ${enabled ? 'enabled' : 'disabled'}` : result.error, !result.ok);
+  if (result.ok) loadAppData();
+}
+async function togglePairAutoforward(id, enabled) {
+  const result = await request(`/api/pairs/${encodeURIComponent(id)}`, {method:'PATCH', body:JSON.stringify({auto_forward:enabled})});
+  toast(result.ok ? `Route auto-forward ${enabled ? 'enabled' : 'disabled'}` : result.error, !result.ok);
+  if (result.ok) loadAppData();
 }
 async function uploadPairThumbnail() { const pairId = document.getElementById('pair-id').value, file = document.getElementById('pair-thumbnail-file')?.files[0]; if (!pairId) return toast('Save the pair before uploading a thumbnail', true); if (!file) return toast('Choose a thumbnail image first', true); const body = new FormData(); body.append('thumbnail', file); const result = await request(`/api/pairs/${encodeURIComponent(pairId)}/thumbnail`, {method:'POST', body}); toast(result.ok ? 'Thumbnail uploaded' : result.error, !result.ok); }
-function pairPayload() { return {name:document.getElementById('pair-name').value.trim(), source:document.getElementById('pair-source').value.trim(), target:document.getElementById('pair-target').value.trim(), include_keywords:document.getElementById('pair-include').value, exclude_keywords:document.getElementById('pair-exclude').value, caption_prefix:document.getElementById('pair-prefix').value, caption_suffix:document.getElementById('pair-suffix').value, rate_profile:document.getElementById('pair-profile').value, rate_delay:Number(document.getElementById('pair-rate').value || 3), max_messages:Number(document.getElementById('pair-max').value || 5000), daily_message_limit:Number(document.getElementById('pair-daily-msg').value || 5000), daily_media_mb:Number(document.getElementById('pair-daily-mb').value || 2048), auto_forward:document.getElementById('pair-auto').checked, allowed_types:[...document.querySelectorAll('.pair-type:checked')].map(input => input.value), protected_behavior:document.getElementById('pair-protected').value, caption_enabled:document.getElementById('pair-caption-enabled').checked, caption_types:[...document.querySelectorAll('.caption-type:checked')].map(input => input.value), thumbnail_enabled:document.getElementById('pair-thumbnail-enabled').checked, remove_links:document.getElementById('pair-links').checked, remove_source_name:document.getElementById('pair-source-name').checked, caption_template:document.getElementById('pair-caption-template').value, schedule_start:document.getElementById('pair-schedule-start').value, schedule_end:document.getElementById('pair-schedule-end').value, quiet_start:document.getElementById('pair-quiet-start').value, quiet_end:document.getElementById('pair-quiet-end').value, max_posts_per_hour:Number(document.getElementById('pair-hourly').value || 0), caption_parse_mode:document.getElementById('pair-caption-mode').value}; }
+function pairPayload() { return {name:document.getElementById('pair-name').value.trim(), batch_id:document.getElementById('pair-batch').value, source:document.getElementById('pair-source').value.trim(), target:document.getElementById('pair-target').value.trim(), include_keywords:document.getElementById('pair-include').value, exclude_keywords:document.getElementById('pair-exclude').value, caption_prefix:document.getElementById('pair-prefix').value, caption_suffix:document.getElementById('pair-suffix').value, rate_profile:document.getElementById('pair-profile').value, rate_delay:Number(document.getElementById('pair-rate').value || 3), max_messages:Number(document.getElementById('pair-max').value || 5000), daily_message_limit:Number(document.getElementById('pair-daily-msg').value || 5000), daily_media_mb:Number(document.getElementById('pair-daily-mb').value || 2048), auto_forward:document.getElementById('pair-auto').checked, allowed_types:[...document.querySelectorAll('.pair-type:checked')].map(input => input.value), protected_behavior:document.getElementById('pair-protected').value, caption_enabled:document.getElementById('pair-caption-enabled').checked, caption_types:[...document.querySelectorAll('.caption-type:checked')].map(input => input.value), thumbnail_enabled:document.getElementById('pair-thumbnail-enabled').checked, remove_links:document.getElementById('pair-links').checked, remove_source_name:document.getElementById('pair-source-name').checked, caption_template:document.getElementById('pair-caption-template').value, schedule_start:document.getElementById('pair-schedule-start').value, schedule_end:document.getElementById('pair-schedule-end').value, quiet_start:document.getElementById('pair-quiet-start').value, quiet_end:document.getElementById('pair-quiet-end').value, max_posts_per_hour:Number(document.getElementById('pair-hourly').value || 0), caption_parse_mode:document.getElementById('pair-caption-mode').value}; }
 async function savePairFromPage() { const payload = pairPayload(); if (!payload.name || !payload.source || !payload.target) return toast('Pair name, source, and target are required', true); if (!payload.allowed_types.length) return toast('Select at least one message type', true); const id = document.getElementById('pair-id').value, result = await request(id ? `/api/pairs/${encodeURIComponent(id)}` : '/api/pairs', {method:id ? 'PATCH' : 'POST', body:JSON.stringify(payload)}); toast(result.ok ? 'Pair saved' : result.error, !result.ok); if (result.ok) { resetPairForm(); loadAppData(); } }
-function editPairPage(id) { const pair = appData.pairs.find(item => item.id === id); if (!pair) return; document.getElementById('pair-id').value = id; document.getElementById('pair-form-title').textContent = 'Edit pair'; Object.entries({'pair-name':'name','pair-source':'source','pair-target':'target','pair-include':'include_keywords','pair-exclude':'exclude_keywords','pair-prefix':'caption_prefix','pair-suffix':'caption_suffix','pair-profile':'rate_profile','pair-rate':'rate_delay','pair-max':'max_messages','pair-daily-msg':'daily_message_limit','pair-daily-mb':'daily_media_mb','pair-protected':'protected_behavior','pair-caption-template':'caption_template','pair-schedule-start':'schedule_start','pair-schedule-end':'schedule_end','pair-quiet-start':'quiet_start','pair-quiet-end':'quiet_end','pair-hourly':'max_posts_per_hour','pair-caption-mode':'caption_parse_mode'}).forEach(([id,key]) => { const el = document.getElementById(id); if (el) el.value = Array.isArray(pair[key]) ? pair[key].join(', ') : (pair[key] ?? ''); }); ['caption-enabled','thumbnail-enabled','links','source-name','auto'].forEach(key => { const el = document.getElementById(`pair-${key}`); if (el) el.checked = !!pair[key === 'caption-enabled' ? 'caption_enabled' : key === 'thumbnail-enabled' ? 'thumbnail_enabled' : key === 'source-name' ? 'remove_source_name' : key === 'auto' ? 'auto_forward' : 'remove_links']; }); document.querySelectorAll('.pair-type').forEach(input => input.checked = (pair.allowed_types || []).includes(input.value)); document.querySelectorAll('.caption-type').forEach(input => input.checked = (pair.caption_types || []).includes(input.value)); document.getElementById('pair-cancel').classList.remove('hidden'); location.hash = 'pair-editor'; renderCaptionPreview(); }
-function resetPairForm() { document.getElementById('pair-id').value = ''; document.getElementById('pair-form-title').textContent = 'Create a pair'; document.querySelectorAll('#pair-editor input:not([type=hidden]),#pair-editor textarea').forEach(el => { if (el.type === 'checkbox') el.checked = false; else el.value = ''; }); document.querySelectorAll('.pair-type,.caption-type').forEach(input => input.checked = true); document.getElementById('pair-rate').value = 3; document.getElementById('pair-max').value = 5000; document.getElementById('pair-daily-msg').value = 5000; document.getElementById('pair-daily-mb').value = 2048; document.getElementById('pair-profile').value = 'balanced'; document.getElementById('pair-protected').value = 'download'; document.getElementById('pair-cancel').classList.add('hidden'); renderCaptionPreview(); }
+function editPairPage(id) { const pair = appData.pairs.find(item => item.id === id); if (!pair) return; renderBatchOptions(pair.batch_id || 'default'); document.getElementById('pair-id').value = id; document.getElementById('pair-form-title').textContent = 'Edit route'; Object.entries({'pair-name':'name','pair-source':'source','pair-target':'target','pair-include':'include_keywords','pair-exclude':'exclude_keywords','pair-prefix':'caption_prefix','pair-suffix':'caption_suffix','pair-profile':'rate_profile','pair-rate':'rate_delay','pair-max':'max_messages','pair-daily-msg':'daily_message_limit','pair-daily-mb':'daily_media_mb','pair-protected':'protected_behavior','pair-caption-template':'caption_template','pair-schedule-start':'schedule_start','pair-schedule-end':'schedule_end','pair-quiet-start':'quiet_start','pair-quiet-end':'quiet_end','pair-hourly':'max_posts_per_hour','pair-caption-mode':'caption_parse_mode'}).forEach(([id,key]) => { const el = document.getElementById(id); if (el) el.value = Array.isArray(pair[key]) ? pair[key].join(', ') : (pair[key] ?? ''); }); ['caption-enabled','thumbnail-enabled','links','source-name','auto'].forEach(key => { const el = document.getElementById(`pair-${key}`); if (el) el.checked = !!pair[key === 'caption-enabled' ? 'caption_enabled' : key === 'thumbnail-enabled' ? 'thumbnail_enabled' : key === 'source-name' ? 'remove_source_name' : key === 'auto' ? 'auto_forward' : 'remove_links']; }); document.querySelectorAll('.pair-type').forEach(input => input.checked = (pair.allowed_types || []).includes(input.value)); document.querySelectorAll('.caption-type').forEach(input => input.checked = (pair.caption_types || []).includes(input.value)); document.getElementById('pair-cancel').classList.remove('hidden'); location.hash = 'pair-editor'; renderCaptionPreview(); }
+function resetPairForm() { document.getElementById('pair-id').value = ''; document.getElementById('pair-form-title').textContent = 'Create a route'; document.querySelectorAll('#pair-editor input:not([type=hidden]),#pair-editor textarea').forEach(el => { if (el.type === 'checkbox') el.checked = false; else el.value = ''; }); document.querySelectorAll('.pair-type,.caption-type').forEach(input => input.checked = true); document.getElementById('pair-rate').value = 3; document.getElementById('pair-max').value = 5000; document.getElementById('pair-daily-msg').value = 5000; document.getElementById('pair-daily-mb').value = 2048; document.getElementById('pair-profile').value = 'balanced'; document.getElementById('pair-protected').value = 'download'; document.getElementById('pair-batch').value = appData.batches[0]?.id || 'default'; document.getElementById('pair-cancel').classList.add('hidden'); renderCaptionPreview(); }
 async function copyPairAgain(id) { const result = await request(`/api/pairs/${encodeURIComponent(id)}/dedupe`, {method:'POST', body:'{}'}); toast(result.ok ? `${result.removed} duplicate identities cleared` : result.error, !result.ok); }
 async function deletePairPage(id) { if (!confirm('Delete this channel pair?')) return; const result = await request(`/api/pairs/${encodeURIComponent(id)}`, {method:'DELETE'}); toast(result.ok ? 'Pair deleted' : result.error, !result.ok); if (result.ok) loadAppData(); }
 async function loadSettings() { const result = await request('/api/settings'); if (!result.ok) return; ['complete','failed','flood'].forEach(key => { const input = document.getElementById(`setting-${key}`); if (input) input.checked = !!result.notification_settings[ key === 'complete' ? 'task_complete' : key === 'failed' ? 'task_failed' : 'flood_wait' ]; }); const auto = document.getElementById('setting-auto'); if (auto) auto.checked = !!result.auto_forward; const set = (id,value) => { const node = document.getElementById(id); if (node) node.textContent = value; }; set('setting-max', result.max_task_messages); set('setting-storage', `${result.storage_limit_mb} MB`); set('settings-source', appData.status.source || 'Not set'); set('settings-target', appData.status.target || 'Not set'); }
