@@ -26,6 +26,7 @@ import random
 import secrets
 import shutil
 import mimetypes
+import sqlite3
 from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -104,7 +105,7 @@ MSG_DELAY    = 3        # seconds between messages
 BATCH_SIZE   = 10      # messages per batch
 BATCH_DELAY  = 10      # seconds after each batch
 MIN_RATE_DELAY = 3
-MAX_BATCH_TASKS = 5
+MAX_BATCH_TASKS = 50
 MAX_TASK_MESSAGES = 5000
 TASK_PRIORITIES = {"low": 10, "normal": 20, "high": 30}
 RATE_PROFILES = {"very_safe": 5, "balanced": 3, "slow": 10}
@@ -180,6 +181,8 @@ def _normalise_pair_setting(key, value):
 SESSION_FILE = "archive_session"
 STATE_FILE   = "sync_state.json"
 STATE_BACKUP_FILE = f"{STATE_FILE}.bak"
+STATE_DB_FILE = "archive_state.sqlite3"
+STATE_SCHEMA_VERSION = 2
 STATE_WRITE_LOCK = threading.Lock()
 TELEGRAM_STARTING = True
 
@@ -243,7 +246,84 @@ def persist_session_string():
         logger.warning("Could not persist Telegram session: %s", exc)
 
 # ─── STATE MANAGEMENT ─────────────────────────────────
+def _state_db_read():
+    """Read the latest transactional state snapshot, if one exists."""
+    if not Path(STATE_DB_FILE).exists():
+        return None
+    try:
+        with sqlite3.connect(STATE_DB_FILE, timeout=10) as connection:
+            connection.execute("PRAGMA busy_timeout = 10000")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS state_snapshots (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    schema_version INTEGER NOT NULL,
+                    payload TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            row = connection.execute(
+                "SELECT payload FROM state_snapshots WHERE id = 1"
+            ).fetchone()
+        if not row:
+            return None
+        value = json.loads(row[0])
+        if not isinstance(value, dict):
+            raise ValueError("state snapshot is not an object")
+        return value
+    except (OSError, sqlite3.Error, json.JSONDecodeError, ValueError) as exc:
+        logging.getLogger("SyncBot").warning(
+            "Could not load SQLite state snapshot: %s", exc
+        )
+        return None
+
+
+def _state_db_write(state):
+    """Store one atomic state snapshot in SQLite for restart recovery."""
+    payload = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
+    try:
+        with sqlite3.connect(STATE_DB_FILE, timeout=10) as connection:
+            connection.execute("PRAGMA busy_timeout = 10000")
+            connection.execute("PRAGMA journal_mode = WAL")
+            connection.execute("PRAGMA synchronous = FULL")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS state_snapshots (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    schema_version INTEGER NOT NULL,
+                    payload TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO state_snapshots (id, schema_version, payload, updated_at)
+                VALUES (1, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    schema_version = excluded.schema_version,
+                    payload = excluded.payload,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    STATE_SCHEMA_VERSION,
+                    payload,
+                    datetime.now().isoformat(timespec="seconds"),
+                ),
+            )
+            connection.commit()
+    except (OSError, sqlite3.Error) as exc:
+        logging.getLogger("SyncBot").warning(
+            "SQLite state snapshot unavailable; JSON persistence remains active: %s",
+            exc,
+        )
+
+
 def load_state():
+    snapshot = _state_db_read()
+    if snapshot is not None:
+        return snapshot
     for path in (Path(STATE_FILE), Path(STATE_BACKUP_FILE)):
         if not path.exists():
             continue
@@ -260,6 +340,9 @@ def save_state(state):
     # Flask, the bot and Telethon handlers can persist at the same time.
     # Keep one previous generation so a failed write can be recovered on restart.
     with STATE_WRITE_LOCK:
+        state["_schema_version"] = STATE_SCHEMA_VERSION
+        serialized = json.dumps(state, ensure_ascii=False, indent=2)
+        _state_db_write(state)
         tmp_path = f"{STATE_FILE}.tmp"
         if Path(STATE_FILE).exists():
             try:
@@ -268,8 +351,10 @@ def save_state(state):
                 logging.getLogger("SyncBot").warning(
                     "Could not update state backup: %s", exc
                 )
-        with open(tmp_path, "w") as f:
-            json.dump(state, f, indent=2)
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(serialized)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp_path, STATE_FILE)
     _dashboard_changed()
 
@@ -304,14 +389,32 @@ state.setdefault("media_fingerprints", {})
 state.setdefault("pair_health", {})
 state.setdefault("oversized_messages", [])
 state.setdefault("templates", {})
+state.setdefault("batches", [])
 state.setdefault("notification_settings", {
     "task_complete": True, "task_failed": True, "flood_wait": True,
     "disconnect": True, "daily_summary": False,
 })
+_state_batches_changed = False
+if not state["batches"]:
+    state["batches"] = [{
+        "id": "default",
+        "name": "Default batch",
+        "auto_forward": True,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }]
+    _state_batches_changed = True
+_batch_ids = {str(batch.get("id")) for batch in state["batches"]}
 for _pair in state.get("pairs", []):
     # Missing setting means automatic new-post forwarding is enabled.
     # An explicit False remains disabled.
     _pair.setdefault("auto_forward", True)
+    if not _pair.get("batch_id") or str(_pair["batch_id"]) not in _batch_ids:
+        _pair["batch_id"] = "default"
+        _state_batches_changed = True
+for _batch in state["batches"]:
+    _batch.setdefault("auto_forward", True)
+if _state_batches_changed:
+    save_state(state)
 
 # Sync requests are queued instead of being rejected while another sync runs.
 _task_queue = deque()
@@ -331,6 +434,8 @@ def _task_view(task):
         "min_id": task.get("min_id", 0),
         "limit": task.get("limit"),
         "pair_id": task.get("pair_id"),
+        "batch_id": task.get("batch_id"),
+        "batch_name": task.get("batch_name"),
         "stats": task.get("stats", {}),
         "started_at": task.get("started_at"),
         "finished_at": task.get("finished_at"),
@@ -347,6 +452,18 @@ def _task_view(task):
 
 def _pair_by_id(pair_id):
     return next((p for p in state.get("pairs", []) if p.get("id") == pair_id), None)
+
+
+def _batch_by_id(batch_id):
+    return next(
+        (batch for batch in state.get("batches", [])
+         if str(batch.get("id")) == str(batch_id)),
+        None,
+    )
+
+
+def _batch_for_pair(pair):
+    return _batch_by_id((pair or {}).get("batch_id", "default"))
 
 
 def _pair_config(pair):
@@ -971,6 +1088,8 @@ def _queue_sync(source, target, reverse=True, min_id=0, limit=None,
         "mode": mode,
         "priority": priority if priority in TASK_PRIORITIES else "normal",
         "pair_id": pair_id or "default",
+        "batch_id": (pair or {}).get("batch_id", "default"),
+        "batch_name": (_batch_for_pair(pair) or {}).get("name", "Default batch"),
         "config": task_config,
         "task_settings": task_config,
         "progress_msg": progress_msg or WebEvent(),
@@ -3307,14 +3426,32 @@ async def auto_forward_handler(event):
             return
         routes = []
         for pair in state.get("pairs", []):
-            if not pair.get("auto_forward"):
+            batch = _batch_for_pair(pair)
+            if not pair.get("auto_forward") or (batch and not batch.get("auto_forward", True)):
                 continue
-            source_entity = await client.get_entity(pair["source"])
+            try:
+                source_entity = await client.get_entity(pair["source"])
+            except Exception as exc:
+                _log_operation(
+                    "warning",
+                    f"Auto-forward source unavailable: {type(exc).__name__}: {exc}",
+                    phase="autoforward",
+                    pair=pair.get("id"),
+                    source=pair.get("source"),
+                )
+                continue
             if event.chat_id == _telegram_chat_id(source_entity):
                 routes.append((pair, source_entity))
 
         # Preserve the older global toggle for the default source/target pair.
-        if state.get("auto_forward") and state.get("source") and state.get("target"):
+        # Only use this fallback for states created before channel pairs
+        # existed; a configured default pair must obey its own toggles.
+        if (
+            not _pair_by_id("default")
+            and state.get("auto_forward")
+            and state.get("source")
+            and state.get("target")
+        ):
             source_entity = await client.get_entity(state["source"])
             if event.chat_id == _telegram_chat_id(source_entity):
                 legacy = {
@@ -3336,6 +3473,15 @@ async def auto_forward_handler(event):
                     continue
                 handled_routes.add(route_key)
                 pair_config = _pair_config(pair)
+                _log_operation(
+                    "info",
+                    "Auto-forward route matched",
+                    phase="autoforward",
+                    message_id=message.id,
+                    pair=pair.get("id", "legacy"),
+                    source=pair.get("source_title", pair.get("source")),
+                    target=pair.get("target_title", pair.get("target")),
+                )
                 if not _within_schedule(pair_config):
                     _log_live(f"⏸️ Auto-forward quiet/schedule window skipped ID={message.id}")
                     continue
@@ -3530,22 +3676,34 @@ async def _set_target(channel_input):
     return {"ok": True, "title": state["target_title"]}
 
 
-async def _create_pair(payload):
-    source = parse_channel_input(str(payload.get("source", "")))
-    target = parse_channel_input(str(payload.get("target", "")))
+async def _resolve_channel_route(source_input, target_input):
+    source = parse_channel_input(str(source_input or ""))
+    target = parse_channel_input(str(target_input or ""))
     if not source or not target:
         raise ValueError("Source and target are required")
+    src_entity, tgt_entity = await asyncio.gather(
+        client.get_entity(source), client.get_entity(target)
+    )
+    return source, target, src_entity, tgt_entity
+
+
+async def _create_pair(payload):
+    source, target, src_entity, tgt_entity = await _resolve_channel_route(
+        payload.get("source"), payload.get("target")
+    )
+    batch_id = str(payload.get("batch_id") or "default")
+    batch = _batch_by_id(batch_id)
+    if not batch:
+        raise ValueError("Selected batch does not exist")
     caption_template = str(payload.get("caption_template", ""))
     template_error = _caption_template_error(caption_template)
     if template_error:
         raise ValueError(template_error)
-    src_entity, tgt_entity = await asyncio.gather(
-        client.get_entity(source), client.get_entity(target)
-    )
     pair = {
         "id": uuid.uuid4().hex[:8],
         "name": str(payload.get("name") or "Pair"),
         "source": source, "target": target,
+        "batch_id": batch_id,
         "source_title": getattr(src_entity, "title", str(source)),
         "target_title": getattr(tgt_entity, "title", str(target)),
         "allowed_types": _normalise_types(payload.get("allowed_types")),
@@ -3580,7 +3738,49 @@ async def _create_pair(payload):
     }
     state.setdefault("pairs", []).append(pair)
     save_state(state)
+    _log_operation(
+        "info",
+        "Channel route created",
+        phase="config",
+        pair_id=pair["id"],
+        batch=batch.get("name", batch_id),
+        source=pair["source_title"],
+        target=pair["target_title"],
+    )
     return pair
+
+
+def _batch_view(batch):
+    pairs = [
+        pair for pair in state.get("pairs", [])
+        if str(pair.get("batch_id", "default")) == str(batch.get("id"))
+    ]
+    return {
+        **batch,
+        "pair_ids": [pair.get("id") for pair in pairs],
+        "route_count": len(pairs),
+        "source_count": len({str(pair.get("source")) for pair in pairs}),
+        "target_count": len({str(pair.get("target")) for pair in pairs}),
+    }
+
+
+def _create_batch(payload):
+    name = str(payload.get("name", "")).strip()
+    if not name:
+        raise ValueError("Batch name is required")
+    if len(name) > 80:
+        raise ValueError("Batch name must be 80 characters or fewer")
+    batch = {
+        "id": uuid.uuid4().hex[:8],
+        "name": name,
+        "auto_forward": bool(payload.get("auto_forward", True)),
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    state.setdefault("batches", []).append(batch)
+    save_state(state)
+    _log_operation("info", "Channel batch created", phase="config",
+                   batch=batch["id"], name=batch["name"])
+    return batch
 
 
 async def _dry_run_pair(pair, mode="full", limit=None, min_id=0):
@@ -3715,6 +3915,7 @@ def _status_payload():
         "source":  state.get("source_title", ""),
         "target":  state.get("target_title", ""),
         "pairs":   state.get("pairs", []),
+        "batches": [_batch_view(batch) for batch in state.get("batches", [])],
         "last_id": state.get("last_synced_id", 0),
         "current": cur,
         "total":   tot,
@@ -3733,9 +3934,10 @@ def _status_payload():
         "transfer": state.get("transfer"),
         "storage": _storage_snapshot(),
         "persistence": {
-            "backend": "json",
+            "backend": "sqlite snapshot + atomic JSON backup",
             "state_file": STATE_FILE,
             "backup_file": STATE_BACKUP_FILE,
+            "database_file": STATE_DB_FILE,
             "backup_available": Path(STATE_BACKUP_FILE).exists(),
         },
         "pair_health": state.get("health", {}),
@@ -3845,7 +4047,66 @@ def api_settarget():
 
 @flask_app.route("/api/pairs", methods=["GET"])
 def api_pairs():
-    return jsonify({"ok": True, "pairs": state.get("pairs", [])})
+    return jsonify({
+        "ok": True,
+        "pairs": state.get("pairs", []),
+        "batches": [_batch_view(batch) for batch in state.get("batches", [])],
+    })
+
+
+@flask_app.route("/api/batches", methods=["GET", "POST"])
+def api_batches():
+    if request.method == "GET":
+        return jsonify({
+            "ok": True,
+            "batches": [_batch_view(batch) for batch in state.get("batches", [])],
+        })
+    try:
+        batch = _create_batch(request.json or {})
+        return jsonify({"ok": True, "batch": _batch_view(batch)})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+
+@flask_app.route("/api/batches/<batch_id>", methods=["PATCH", "DELETE"])
+def api_batch_control(batch_id):
+    batch = _batch_by_id(batch_id)
+    if not batch:
+        return jsonify({"ok": False, "error": "Batch not found"}), 404
+    if request.method == "PATCH":
+        payload = request.json or {}
+        if "name" in payload:
+            name = str(payload.get("name", "")).strip()
+            if not name or len(name) > 80:
+                return jsonify({"ok": False, "error": "Batch name must be 1–80 characters"}), 400
+            batch["name"] = name
+        if "auto_forward" in payload:
+            batch["auto_forward"] = bool(payload["auto_forward"])
+        save_state(state)
+        _log_operation(
+            "info",
+            "Channel batch updated",
+            phase="config",
+            batch=batch_id,
+            name=batch.get("name"),
+            auto_forward=batch.get("auto_forward"),
+        )
+        return jsonify({"ok": True, "batch": _batch_view(batch)})
+    if batch_id == "default":
+        return jsonify({"ok": False, "error": "Default batch cannot be deleted"}), 400
+    assigned = [
+        pair for pair in state.get("pairs", [])
+        if str(pair.get("batch_id", "default")) == str(batch_id)
+    ]
+    if assigned:
+        return jsonify({
+            "ok": False,
+            "error": "Move or delete this batch's routes before deleting the batch",
+            "route_count": len(assigned),
+        }), 409
+    state["batches"] = [item for item in state.get("batches", []) if str(item.get("id")) != str(batch_id)]
+    save_state(state)
+    return jsonify({"ok": True})
 
 
 @flask_app.route("/api/pairs", methods=["POST"])
@@ -3868,15 +4129,36 @@ def api_delete_pair(pair_id):
             template_error = _caption_template_error(str(payload.get("caption_template", "")))
             if template_error:
                 return jsonify({"ok": False, "error": template_error}), 400
+        if "source" in payload or "target" in payload:
+            try:
+                source, target, source_entity, target_entity = _run_async(
+                    _resolve_channel_route(
+                        payload.get("source", pair.get("source")),
+                        payload.get("target", pair.get("target")),
+                    )
+                )
+            except Exception as exc:
+                return jsonify({"ok": False, "error": f"Could not resolve route: {exc}"}), 400
+            pair.update({
+                "source": source,
+                "target": target,
+                "source_title": getattr(source_entity, "title", str(source)),
+                "target_title": getattr(target_entity, "title", str(target)),
+            })
         for key in ("name", "rate_profile", "rate_delay", "max_messages",
                     "daily_message_limit", "daily_media_mb", "auto_forward",
                     "caption_prefix", "caption_suffix", "remove_links",
                     "remove_source_name", "include_keywords", "exclude_keywords",
                     "allowed_types", "dedupe_mode", "max_posts_per_hour",
                     "schedule_start", "schedule_end", "quiet_start", "quiet_end",
-                    "protected_behavior", "caption_enabled", "caption_template",
-                    "caption_types", "caption_parse_mode", "thumbnail_enabled"):
+                     "protected_behavior", "caption_enabled", "caption_template",
+                     "caption_types", "caption_parse_mode", "thumbnail_enabled",
+                     "batch_id"):
             if key in payload:
+                if key == "batch_id":
+                    if not _batch_by_id(str(payload[key])):
+                        return jsonify({"ok": False, "error": "Batch not found"}), 400
+                    payload[key] = str(payload[key])
                 pair[key] = _normalise_pair_setting(key, payload[key])
         save_state(state)
         return jsonify({"ok": True, "pair": pair})
